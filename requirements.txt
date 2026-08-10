@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+SQLAlchemy
+alembic
+psycopg[binary]
+redis
+httpx
+PyJWT[crypto]
+cryptography
+PyYAML==6.0.3
