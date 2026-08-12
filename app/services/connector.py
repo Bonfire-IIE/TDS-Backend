@@ -6,7 +6,11 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.identifier import gen_connector_code
-from app.integrations.kuscia import KusciaError, get_kuscia_client
+from app.integrations.kuscia import (
+    KusciaError,
+    get_kuscia_client,
+    get_kuscia_master_deploy_endpoint,
+)
 from app.models.connector import Connector
 from app.schemas.connector import ConnectorApply, ConnectorImport
 
@@ -158,7 +162,7 @@ def display_status(c: Connector) -> str:
 
 def _deploy_commands(c: Connector, token: str | None) -> str:
     img = settings.kuscia_image
-    master = settings.kuscia_master_deploy_endpoint
+    master = get_kuscia_master_deploy_endpoint()
     tok = token or "<部署令牌不可用：请确认该连接器已审批且令牌未被使用>"
     domain_id = c.kuscia_domain_id
     auth, api = c.auth_port or 1080, c.lite_api_port or 8082
@@ -184,7 +188,7 @@ def deploy_info(c: Connector) -> dict:
     return {
         "kuscia_domain_id": c.kuscia_domain_id,
         "deploy_token": token,
-        "master_endpoint": settings.kuscia_master_deploy_endpoint,
+        "master_endpoint": get_kuscia_master_deploy_endpoint(),
         "kuscia_image": settings.kuscia_image,
         "commands": _deploy_commands(c, token),
     }

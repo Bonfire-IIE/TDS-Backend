@@ -358,9 +358,55 @@ class KusciaClient:
         self._client.close()
 
 
-@lru_cache
 def get_kuscia_client() -> KusciaClient:
+    """优先使用中心平台数据库中启用的 Master；环境变量仅作兼容回退。
+
+    不缓存数据库解析结果，使引导页上传凭据后无需重启后端即可生效。
+    """
+    try:
+        from sqlalchemy import select
+        from app.core.db import SessionLocal
+        from app.models.kuscia_master import KusciaMaster
+
+        with SessionLocal() as db:
+            master = db.scalars(
+                select(KusciaMaster)
+                .where(
+                    KusciaMaster.enabled.is_(True),
+                    KusciaMaster.credential_ref.is_not(None),
+                )
+                .order_by(KusciaMaster.created_at.desc())
+            ).first()
+            if master and master.credential_ref.startswith("file:"):
+                endpoint = f"{master.scheme}://{master.deployment_ip}:{master.api_port}"
+                return KusciaClient(endpoint=endpoint, cert_dir=master.credential_ref[5:])
+    except Exception as exc:
+        # 数据库暂不可用时仍允许老部署继续使用 .env；若 env 也未配置则保留原始错误。
+        if not settings.kuscia_api_endpoint or not settings.kuscia_cert_dir:
+            raise KusciaError(f"无法解析 Kuscia Master 配置: {exc}") from exc
     return KusciaClient()
+
+
+def get_kuscia_master_deploy_endpoint() -> str:
+    """返回连接器部署时使用的 Master 网关地址，数据库优先、环境变量回退。"""
+    try:
+        from sqlalchemy import select
+        from app.core.db import SessionLocal
+        from app.models.kuscia_master import KusciaMaster
+
+        with SessionLocal() as db:
+            master = db.scalars(
+                select(KusciaMaster)
+                .where(KusciaMaster.enabled.is_(True))
+                .order_by(KusciaMaster.created_at.desc())
+            ).first()
+            if master:
+                if master.deploy_endpoint:
+                    return master.deploy_endpoint.rstrip("/")
+                return f"https://{master.deployment_ip}:18080"
+    except Exception:
+        pass
+    return settings.kuscia_master_deploy_endpoint.rstrip("/")
 
 
 @lru_cache

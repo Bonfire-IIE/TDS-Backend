@@ -1,8 +1,8 @@
 """Administration APIs for importing externally deployed Kuscia Masters."""
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from datetime import datetime, timezone
 from pathlib import Path
-import os, tempfile
+import os
 from app.core.config import settings
 from app.integrations.kuscia import KusciaClient, KusciaError
 from sqlalchemy import select
@@ -17,6 +17,7 @@ from app.schemas.kuscia_master import (
     KusciaMasterImport,
     KusciaMasterOut,
     KusciaMasterUpdate,
+    KusciaMasterDeployGuide,
     normalized_ip,
 )
 
@@ -33,6 +34,69 @@ def _get_or_404(db: Session, master_id: str) -> KusciaMaster:
     if master is None:
         raise HTTPException(status_code=404, detail="Kuscia Master 节点不存在")
     return master
+
+
+def _primary_master(db: Session) -> KusciaMaster | None:
+    return db.scalars(
+        select(KusciaMaster)
+        .where(KusciaMaster.enabled.is_(True))
+        .order_by(KusciaMaster.created_at.desc())
+    ).first()
+
+
+@router.get("/onboarding/state")
+def onboarding_state(
+    _user: dict = Depends(admin_user), db: Session = Depends(get_db)
+) -> dict:
+    """引导页只读状态；数据库记录是引导页和中心平台共同的唯一事实来源。"""
+    master = _primary_master(db)
+    if master is None:
+        return _wrap({"configured": False, "completed": False, "master": None})
+    completed = master.status in {"credentials_uploaded", "connected"}
+    return _wrap({
+        "configured": True,
+        "completed": completed,
+        "master": KusciaMasterOut.model_validate(master),
+    })
+
+
+@router.post("/onboarding/deploy-script")
+def onboarding_deploy_script(
+    body: KusciaMasterDeployGuide,
+    _user: dict = Depends(admin_user),
+) -> dict:
+    """生成由运营方在 Master 主机执行的脚本；平台本身不远程执行命令。"""
+    image = (body.kuscia_image or settings.kuscia_image).strip()
+    if not image:
+        raise HTTPException(status_code=422, detail="未配置 Kuscia 镜像，请填写镜像地址")
+    ip = normalized_ip(body.deployment_ip)
+    deploy_endpoint = f"https://{ip}:{body.gateway_port}"
+    api_endpoint = f"https://{ip}:{body.api_port}"
+    commands = f'''#!/bin/bash
+set -euo pipefail
+
+export KUSCIA_IMAGE="{image}"
+export KUSCIA_DOMAIN_ID="{body.domain_id}"
+
+docker pull "$KUSCIA_IMAGE"
+docker run --rm "$KUSCIA_IMAGE" cat /home/kuscia/scripts/deploy/kuscia.sh > kuscia.sh
+chmod u+x kuscia.sh
+docker run --rm "$KUSCIA_IMAGE" kuscia init --mode master --domain "$KUSCIA_DOMAIN_ID" > kuscia_master.yaml
+./kuscia.sh start -c kuscia_master.yaml -p {body.gateway_port} -k {body.api_port}
+
+# 导出中心平台访问 KusciaAPI 所需的四个凭据文件
+MASTER_CONTAINER="$(docker ps --format '{{{{.Names}}}}' | grep 'kuscia-master' | head -n1)"
+test -n "$MASTER_CONTAINER"
+mkdir -p ./kuscia-master-certs
+docker cp "$MASTER_CONTAINER":/home/kuscia/var/certs/. ./kuscia-master-certs/
+ls -1 ./kuscia-master-certs
+'''
+    return _wrap({
+        "commands": commands,
+        "api_endpoint": api_endpoint,
+        "deploy_endpoint": deploy_endpoint,
+        "kuscia_image": image,
+    })
 
 
 @router.get("")
@@ -71,8 +135,9 @@ def import_master(
 @router.post("/{master_id}/credentials")
 async def upload_credentials(master_id: str, ca: UploadFile = File(...), cert: UploadFile = File(...), key: UploadFile = File(...), token: UploadFile = File(...), user: dict = Depends(admin_user), db: Session = Depends(get_db)) -> dict:
     master = _get_or_404(db, master_id)
+    if not settings.kuscia_credential_root:
+        raise HTTPException(500, "未配置 KUSCIA_CREDENTIAL_ROOT")
     root = Path(settings.kuscia_credential_root)
-    if not root: raise HTTPException(500, "未配置 KUSCIA_CREDENTIAL_ROOT")
     target = root / master.id
     target.mkdir(parents=True, exist_ok=True); os.chmod(target, 0o700)
     for name, upload in (("ca.crt", ca), ("kusciaapi-server.crt", cert), ("kusciaapi-server.key", key), ("token", token)):
