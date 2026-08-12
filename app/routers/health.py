@@ -4,7 +4,7 @@ from sqlalchemy import text
 
 from app.core.db import engine
 from app.core.redis import redis_client
-from app.integrations.kuscia import get_kuscia_client
+from app.integrations.kuscia import get_kuscia_client, kuscia_master_configured
 from app.core.config import settings
 
 router = APIRouter(tags=["health"])
@@ -38,6 +38,6 @@ def config_health() -> dict:
         "keycloak_configured": bool(settings.keycloak_base_url),
         "opa_configured": bool(settings.opa_url),
         "rekor_configured": bool(settings.rekor_url),
-        "kuscia_configured": bool(settings.kuscia_api_endpoint and settings.kuscia_cert_dir),
+        "kuscia_configured": kuscia_master_configured(),
         "platform_registry_configured": bool(settings.platform_registry_enabled and settings.platform_registry and settings.platform_registry_project),
     }}

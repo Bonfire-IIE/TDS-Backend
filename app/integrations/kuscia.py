@@ -49,9 +49,8 @@ class ChunkedJsonParser:
 
 
 class KusciaClient:
-    def __init__(self, endpoint: str | None = None, cert_dir: str | None = None) -> None:
-        self.endpoint = (endpoint or settings.kuscia_api_endpoint).rstrip("/")
-        cert_dir = cert_dir or settings.kuscia_cert_dir
+    def __init__(self, endpoint: str, cert_dir: str) -> None:
+        self.endpoint = endpoint.rstrip("/")
         crt = os.path.join(cert_dir, "kusciaapi-server.crt")
         key = os.path.join(cert_dir, "kusciaapi-server.key")
         ca = os.path.join(cert_dir, "ca.crt")
@@ -359,10 +358,7 @@ class KusciaClient:
 
 
 def get_kuscia_client() -> KusciaClient:
-    """优先使用中心平台数据库中启用的 Master；环境变量仅作兼容回退。
-
-    不缓存数据库解析结果，使引导页上传凭据后无需重启后端即可生效。
-    """
+    """从数据库读取中心平台当前启用的 Master（唯一配置来源）。"""
     try:
         from sqlalchemy import select
         from app.core.db import SessionLocal
@@ -381,14 +377,12 @@ def get_kuscia_client() -> KusciaClient:
                 endpoint = f"{master.scheme}://{master.deployment_ip}:{master.api_port}"
                 return KusciaClient(endpoint=endpoint, cert_dir=master.credential_ref[5:])
     except Exception as exc:
-        # 数据库暂不可用时仍允许老部署继续使用 .env；若 env 也未配置则保留原始错误。
-        if not settings.kuscia_api_endpoint or not settings.kuscia_cert_dir:
-            raise KusciaError(f"无法解析 Kuscia Master 配置: {exc}") from exc
-    return KusciaClient()
+        raise KusciaError(f"无法读取 Kuscia Master 配置: {exc}") from exc
+    raise KusciaError("尚未完成 Kuscia Master 接入，请先完成中心平台初始化向导")
 
 
 def get_kuscia_master_deploy_endpoint() -> str:
-    """返回连接器部署时使用的 Master 网关地址，数据库优先、环境变量回退。"""
+    """返回连接器部署使用的 Master 网关地址（数据库唯一来源）。"""
     try:
         from sqlalchemy import select
         from app.core.db import SessionLocal
@@ -404,9 +398,26 @@ def get_kuscia_master_deploy_endpoint() -> str:
                 if master.deploy_endpoint:
                     return master.deploy_endpoint.rstrip("/")
                 return f"https://{master.deployment_ip}:18080"
+    except Exception as exc:
+        raise KusciaError(f"无法读取 Kuscia Master 部署地址: {exc}") from exc
+    raise KusciaError("尚未配置 Kuscia Master 部署地址")
+
+
+def kuscia_master_configured() -> bool:
+    """健康诊断用：数据库是否存在启用且已上传凭据的 Master。"""
+    try:
+        from sqlalchemy import select
+        from app.core.db import SessionLocal
+        from app.models.kuscia_master import KusciaMaster
+        with SessionLocal() as db:
+            return db.scalars(
+                select(KusciaMaster.id).where(
+                    KusciaMaster.enabled.is_(True),
+                    KusciaMaster.credential_ref.is_not(None),
+                ).limit(1)
+            ).first() is not None
     except Exception:
-        pass
-    return settings.kuscia_master_deploy_endpoint.rstrip("/")
+        return False
 
 
 @lru_cache

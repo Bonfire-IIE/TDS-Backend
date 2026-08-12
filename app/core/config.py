@@ -26,9 +26,8 @@ class Settings(BaseSettings):
     platform_registry: str = ""
     platform_registry_project: str = ""
 
-    # Kuscia KusciaAPI（HTTP + mTLS + Token）——master 经 center 模式发布到宿主机 18081
-    kuscia_api_endpoint: str = ""
-    kuscia_cert_dir: str = ""
+    # Kuscia Master 地址与凭据引用由运营方在引导页配置并存入数据库；环境变量
+    # 只定义后端保存上传凭据的根目录。
     kuscia_credential_root: str = ""
     # 数据源(DomainDataSource)含加密 info，master 无权操作，须经各连接器(domain)自身的
     # Lite KusciaAPI 下发。dev 环境两个 Lite 的 KusciaAPI 经宿主机端口(-k)暴露，
@@ -46,9 +45,6 @@ class Settings(BaseSettings):
     kuscia_log_max_lines: int = 5000
     # 连接器部署指引所需（dev 占位，可用环境变量覆盖）
     kuscia_image: str = ""
-    # 连接器主机访问 master 的地址：master 的节点认证端口(容器内 1080)已发布到宿主机 18080，
-    # 经宿主机可路由 IP 对外，支持跨机连接器接入。跨网段时改为对连接器可达的地址。
-    kuscia_master_deploy_endpoint: str = ""
     # TDS 标识码生成用：主体标识码(18位)与区域/行业代码(4位)。org 正式模型建好前用平台占位。
     tds_default_subject_code: str = "91110000000000000X"
     tds_default_region_industry: str = "1101"
