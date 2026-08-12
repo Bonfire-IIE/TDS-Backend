@@ -12,17 +12,19 @@ router = APIRouter(prefix="/cluster", tags=["cluster"])
 
 @router.get("/status")
 def cluster_status(db: Session = Depends(get_db)) -> dict:
-    client = get_kuscia_client()
     result: dict = {"kusciaApi": "up", "domains": []}
     domain_ids = list(db.scalars(
         select(Connector.kuscia_domain_id)
         .where(Connector.deleted_at.is_(None), Connector.status == "approved")
         .order_by(Connector.kuscia_domain_id)
     ))
-    if not domain_ids:
-        result["message"] = "KusciaAPI 已连接，当前没有已审批的连接器"
-        return {"code": 0, "message": "ok", "data": result}
     try:
+        # 客户端构造本身可能因未配置 Master / 未完成迁移而失败；集群概览应
+        # 返回可展示的 down 状态，而非让整个 API 变成 500。
+        client = get_kuscia_client()
+        if not domain_ids:
+            result["message"] = "KusciaAPI 已连接，当前没有已审批的连接器"
+            return {"code": 0, "message": "ok", "data": result}
         domains = client.batch_query_domains(domain_ids)
         result["domains"] = [
             {
