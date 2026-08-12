@@ -9,12 +9,16 @@ class KusciaMasterImport(BaseModel):
     name: str = Field("Kuscia Master", min_length=1, max_length=128)
     deployment_ip: IPvAnyAddress
     api_port: int = Field(..., ge=1, le=65535)
+    scheme: str = Field("https", pattern="^(http|https)$")
+    deploy_endpoint: str | None = None
 
 
 class KusciaMasterUpdate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=128)
     deployment_ip: IPvAnyAddress | None = None
     api_port: int | None = Field(None, ge=1, le=65535)
+    scheme: str | None = Field(None, pattern="^(http|https)$")
+    deploy_endpoint: str | None = None
     enabled: bool | None = None
 
 
@@ -23,6 +27,12 @@ class KusciaMasterOut(BaseModel):
     name: str
     deployment_ip: str
     api_port: int
+    scheme: str
+    deploy_endpoint: str | None
+    credential_ref: str | None
+    status: str
+    last_checked_at: datetime | None
+    last_error: str | None
     enabled: bool
     created_by: str
     created_at: datetime

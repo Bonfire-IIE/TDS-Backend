@@ -6,9 +6,11 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import ssl
 from functools import lru_cache
+from typing import AsyncIterator
 
 import httpx
 
@@ -17,6 +19,33 @@ from app.core.config import settings
 
 class KusciaError(RuntimeError):
     pass
+
+
+class ChunkedJsonParser:
+    """增量切分 chunked 响应里背靠背的 JSON 对象。
+
+    Kuscia 的流式接口既不换行分隔也不套外层数组，故按 raw_decode 逐个吃掉对象，
+    尾部不完整的部分留到下一个 chunk。
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._decoder = json.JSONDecoder()
+
+    def feed(self, chunk: str) -> list[dict]:
+        self._buffer += chunk
+        out: list[dict] = []
+        while True:
+            self._buffer = self._buffer.lstrip()
+            if not self._buffer:
+                break
+            try:
+                obj, end = self._decoder.raw_decode(self._buffer)
+            except ValueError:
+                break  # 尾部还不是一个完整对象，等下一个 chunk
+            self._buffer = self._buffer[end:]
+            out.append(obj)
+        return out
 
 
 class KusciaClient:
@@ -35,11 +64,14 @@ class KusciaClient:
         ssl_ctx = ssl.create_default_context(cafile=ca)
         ssl_ctx.check_hostname = False
         ssl_ctx.load_cert_chain(certfile=crt, keyfile=key)
+        # 留存凭据：流式接口要另开一个 AsyncClient（见 stream_node_log）。
+        self._ssl_ctx = ssl_ctx
+        self._headers = {"Token": token, "Content-Type": "application/json"}
         self._client = httpx.Client(
             base_url=self.endpoint,
             verify=ssl_ctx,
             trust_env=False,
-            headers={"Token": token, "Content-Type": "application/json"},
+            headers=self._headers,
             timeout=10.0,
         )
 
@@ -280,10 +312,46 @@ class KusciaClient:
     def delete_job(self, job_id: str) -> None:
         self._post("/api/v1/job/delete", {"job_id": job_id})
 
+    # ---- 节点日志 ----
+    # /api/v1/log/node/* 只读取「接收请求的这个节点」上的日志，从不转发。用 master
+    # 的 KusciaAPI 调用即只能拿到 master 自己的组件日志，看不到任何连接器的日志。
+    def list_node_log_files(self, kind: str | None = None) -> dict:
+        """列出本节点日志文件，返回 data{domain_id,node_name,run_mode,files[]}。
+
+        kind: component（节点组件日志）/ pod（任务容器日志）/ all，缺省 all。
+        """
+        payload = {"kind": kind} if kind else {}
+        return self._post("/api/v1/log/node/files", payload).get("data", {})
+
+    async def stream_node_log(self, payload: dict) -> AsyncIterator[dict]:
+        """流式读取本节点某个日志文件，逐个产出 QueryLogResponse{status,log}。
+
+        Kuscia 以 chunked 回一串**背靠背的 JSON 对象**（无分隔符、也没有外层
+        数组），切分见 ChunkedJsonParser。
+        """
+        parser = ChunkedJsonParser()
+        # timeout=None：跟随流本就长时间无数据，任何读超时都会误杀连接。
+        async with httpx.AsyncClient(
+            base_url=self.endpoint,
+            verify=self._ssl_ctx,
+            trust_env=False,
+            headers=self._headers,
+            timeout=None,
+        ) as client:
+            async with client.stream(
+                "POST", "/api/v1/log/node/log/query", json=payload
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    raise KusciaError(f"KusciaAPI 返回 {resp.status_code}：{body[:500]}")
+                async for chunk in resp.aiter_text():
+                    for obj in parser.feed(chunk):
+                        yield obj
+
     # ---- 健康探测 ----
     def ping(self) -> bool:
         """能成功查到任一已知节点即视为 KusciaAPI 可用。"""
-        self.batch_query_domains(settings.kuscia_domains[:1] or ["kuscia-system"])
+        self.query_domain("kuscia-system")
         return True
 
     def close(self) -> None:

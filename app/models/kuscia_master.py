@@ -22,6 +22,12 @@ class KusciaMaster(Base):
     name: Mapped[str] = mapped_column(String(128))
     deployment_ip: Mapped[str] = mapped_column(String(45))
     api_port: Mapped[int] = mapped_column(Integer)
+    scheme: Mapped[str] = mapped_column(String(8), default="https")
+    deploy_endpoint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    credential_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="unconfigured")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(

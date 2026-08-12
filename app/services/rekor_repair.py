@@ -1,6 +1,7 @@
 """Backfill missing Rekor receipt fields for anchors created by older adapters."""
 from __future__ import annotations
 import os
+from app.core.config import settings
 import httpx
 from sqlalchemy import select
 from app.core.db import SessionLocal
@@ -8,7 +9,7 @@ from app.models.audit import AuditAnchor
 from app.services.rekor import _normalize_entry
 
 def main():
-    endpoint = os.getenv("REKOR_URL", "").rstrip("/")
+    endpoint = settings.rekor_url.rstrip("/")
     if not endpoint: raise SystemExit("REKOR_URL is required")
     with SessionLocal() as db:
         rows = db.execute(select(AuditAnchor).where(AuditAnchor.provider == "rekor", AuditAnchor.log_index.is_(None))).scalars().all()

@@ -5,11 +5,12 @@ With no REKOR_URL it stays idle, preserving local-only audit events.
 """
 from __future__ import annotations
 import os, time
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.services.rekor import process_once
 
 def main() -> None:
-    interval = max(5, int(os.getenv("REKOR_WORKER_INTERVAL", "30")))
+    interval = max(5, int(settings.rekor_worker_interval))
     while True:
         db = SessionLocal()
         try:

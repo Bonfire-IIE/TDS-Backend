@@ -159,6 +159,8 @@ def register(db: Session, username: str, is_operator: bool, body: AppImageCreate
     # config_templates keys are filenames and must not be treated as API field names.
     config_templates = body.config_templates or None
     if body.registry_source == "platform":
+        if not settings.platform_registry_enabled or not settings.platform_registry or not settings.platform_registry_project:
+            raise AppImageError("平台镜像仓库尚未配置，请选择第三方镜像并填写完整镜像地址", 409)
         repository = body.image_name.strip().strip("/")
         prefix = settings.platform_registry_project + "/"
         if repository.startswith(prefix):

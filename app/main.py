@@ -13,6 +13,7 @@ from app.routers import (
     health,
     identity,
     jobs,
+    kuscia_logs,
     products,
     projects,
     usage,
@@ -44,6 +45,7 @@ app.include_router(jobs.router, prefix=settings.api_prefix)
 app.include_router(usage.router, prefix=settings.api_prefix)
 app.include_router(audit.router, prefix=settings.api_prefix)
 app.include_router(kuscia_masters.router, prefix=settings.api_prefix)
+app.include_router(kuscia_logs.router, prefix=settings.api_prefix)
 
 
 @app.get("/")

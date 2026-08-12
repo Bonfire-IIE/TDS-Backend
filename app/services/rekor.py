@@ -1,13 +1,14 @@
 """Rekor outbox adapter. Endpoint is optional; absent endpoint means local-only mode."""
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
-import os, json, uuid, base64, hashlib
+import json, uuid, base64, hashlib
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.models.audit import AuditEvent, AuditOutbox, AuditAnchor
+from app.core.config import settings
 
 def _normalize_entry(result: object, response: httpx.Response | None = None) -> tuple[str | None, dict]:
     """Rekor v1 returns {uuid: {body, logIndex, ...}}, not {entry: ...}."""
@@ -24,7 +25,7 @@ def _normalize_entry(result: object, response: httpx.Response | None = None) -> 
     return (response.headers.get("ETag") if response is not None else None), value
 
 def process_once(db: Session, limit: int = 20) -> int:
-    endpoint = os.getenv("REKOR_URL", "").rstrip("/")
+    endpoint = settings.rekor_url.rstrip("/")
     if not endpoint:
         return 0
     rows = db.execute(select(AuditOutbox).where(AuditOutbox.status.in_(["pending", "retrying"]), (AuditOutbox.next_retry_at.is_(None)) | (AuditOutbox.next_retry_at <= datetime.now(timezone.utc))).order_by(AuditOutbox.created_at).limit(limit).with_for_update(skip_locked=True)).scalars().all()
