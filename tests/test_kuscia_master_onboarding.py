@@ -10,17 +10,21 @@ def test_deploy_script_contains_master_bootstrap(monkeypatch):
     body = KusciaMasterDeployGuide(
         domain_id="bonfire-master",
         deployment_ip="10.2.0.11",
-        gateway_port=18080,
-        api_port=18081,
+        auth_port=13081,
+        api_port=13082,
+        grpc_port=13083,
+        app_port=13080,
+        metrics_port=13084,
     )
 
     result = kuscia_masters.onboarding_deploy_script(body, {})["data"]
 
     assert "kuscia init --mode master" in result["commands"]
-    assert "-p 18080 -k 18081" in result["commands"]
+    assert "-p 13081 -k 13082 -g 13083" in result["commands"]
+    assert "-q 13080 -x 13084" in result["commands"]
     assert "kuscia-master-certs" in result["commands"]
-    assert result["api_endpoint"] == "https://10.2.0.11:18081"
-    assert result["deploy_endpoint"] == "https://10.2.0.11:18080"
+    assert result["api_endpoint"] == "https://10.2.0.11:13082"
+    assert result["deploy_endpoint"] == "https://10.2.0.11:13081"
 
 
 class _ScalarResult:
@@ -62,7 +66,7 @@ def test_onboarding_state_uses_shared_master_record(monkeypatch):
 def test_runtime_client_uses_database_master(monkeypatch):
     master = SimpleNamespace(
         scheme="https", deployment_ip="10.2.0.11", api_port=18081,
-        credential_ref="file:/secure/master-1",
+        credential_ref="file:/secure/master-1", domain_id="bonfire-master",
     )
 
     class Session:
@@ -73,7 +77,9 @@ def test_runtime_client_uses_database_master(monkeypatch):
     monkeypatch.setattr("app.core.db.SessionLocal", lambda: Session())
     monkeypatch.setattr(
         kuscia, "KusciaClient",
-        lambda endpoint, cert_dir: {"endpoint": endpoint, "cert_dir": cert_dir},
+        lambda endpoint, cert_dir, domain_id: {
+            "endpoint": endpoint, "cert_dir": cert_dir, "domain_id": domain_id,
+        },
     )
 
     client = kuscia.get_kuscia_client()
@@ -81,6 +87,7 @@ def test_runtime_client_uses_database_master(monkeypatch):
     assert client == {
         "endpoint": "https://10.2.0.11:18081",
         "cert_dir": "/secure/master-1",
+        "domain_id": "bonfire-master",
     }
 
 

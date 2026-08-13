@@ -49,8 +49,9 @@ class ChunkedJsonParser:
 
 
 class KusciaClient:
-    def __init__(self, endpoint: str, cert_dir: str) -> None:
+    def __init__(self, endpoint: str, cert_dir: str, domain_id: str | None = None) -> None:
         self.endpoint = endpoint.rstrip("/")
+        self.domain_id = domain_id
         crt = os.path.join(cert_dir, "kusciaapi-server.crt")
         key = os.path.join(cert_dir, "kusciaapi-server.key")
         ca = os.path.join(cert_dir, "ca.crt")
@@ -349,8 +350,10 @@ class KusciaClient:
 
     # ---- 健康探测 ----
     def ping(self) -> bool:
-        """能成功查到任一已知节点即视为 KusciaAPI 可用。"""
-        self.query_domain("kuscia-system")
+        """能成功查到当前 Master 自身的 Domain 即视为 KusciaAPI 可用。"""
+        if not self.domain_id:
+            raise KusciaError("未配置 Kuscia Master Domain ID")
+        self.query_domain(self.domain_id)
         return True
 
     def close(self) -> None:
@@ -375,7 +378,11 @@ def get_kuscia_client() -> KusciaClient:
             ).first()
             if master and master.credential_ref.startswith("file:"):
                 endpoint = f"{master.scheme}://{master.deployment_ip}:{master.api_port}"
-                return KusciaClient(endpoint=endpoint, cert_dir=master.credential_ref[5:])
+                return KusciaClient(
+                    endpoint=endpoint,
+                    cert_dir=master.credential_ref[5:],
+                    domain_id=master.domain_id,
+                )
     except Exception as exc:
         raise KusciaError(f"无法读取 Kuscia Master 配置: {exc}") from exc
     raise KusciaError("尚未完成 Kuscia Master 接入，请先完成中心平台初始化向导")
@@ -429,4 +436,4 @@ def get_kuscia_lite_client(domain_id: str, endpoint: str | None = None) -> Kusci
     cert_dir = os.path.join(settings.kuscia_lite_cert_base, domain_id)
     if not os.path.isfile(os.path.join(cert_dir, "token")):
         raise KusciaError(f"缺少连接器 '{domain_id}' 的 Lite KusciaAPI 证书({cert_dir})")
-    return KusciaClient(endpoint=endpoint, cert_dir=cert_dir)
+    return KusciaClient(endpoint=endpoint, cert_dir=cert_dir, domain_id=domain_id)

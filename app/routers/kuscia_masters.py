@@ -70,7 +70,7 @@ def onboarding_deploy_script(
     if not image:
         raise HTTPException(status_code=422, detail="未配置 Kuscia 镜像，请填写镜像地址")
     ip = normalized_ip(body.deployment_ip)
-    deploy_endpoint = f"https://{ip}:{body.gateway_port}"
+    deploy_endpoint = f"https://{ip}:{body.auth_port}"
     api_endpoint = f"https://{ip}:{body.api_port}"
     commands = f'''#!/bin/bash
 set -euo pipefail
@@ -82,7 +82,9 @@ docker pull "$KUSCIA_IMAGE"
 docker run --rm "$KUSCIA_IMAGE" cat /home/kuscia/scripts/deploy/kuscia.sh > kuscia.sh
 chmod u+x kuscia.sh
 docker run --rm "$KUSCIA_IMAGE" kuscia init --mode master --domain "$KUSCIA_DOMAIN_ID" > kuscia_master.yaml
-./kuscia.sh start -c kuscia_master.yaml -p {body.gateway_port} -k {body.api_port}
+./kuscia.sh start -c kuscia_master.yaml \
+  -p {body.auth_port} -k {body.api_port} -g {body.grpc_port} \
+  -q {body.app_port} -x {body.metrics_port}
 
 # 导出中心平台访问 KusciaAPI 所需的四个凭据文件
 MASTER_CONTAINER="$(docker ps --format '{{{{.Names}}}}' | grep 'kuscia-master' | head -n1)"
@@ -117,8 +119,13 @@ def import_master(
 ) -> dict:
     master = KusciaMaster(
         name=body.name.strip(),
+        domain_id=body.domain_id,
         deployment_ip=normalized_ip(body.deployment_ip),
+        auth_port=body.auth_port,
         api_port=body.api_port,
+        grpc_port=body.grpc_port,
+        app_port=body.app_port,
+        metrics_port=body.metrics_port,
         scheme=body.scheme,
         deploy_endpoint=body.deploy_endpoint,
         created_by=user["username"],
@@ -155,7 +162,7 @@ def test_master(master_id: str, user: dict = Depends(admin_user), db: Session = 
         raise HTTPException(409, "尚未上传 Kuscia Master 凭据")
     endpoint = f"{master.scheme}://{master.deployment_ip}:{master.api_port}"
     try:
-        KusciaClient(endpoint=endpoint, cert_dir=master.credential_ref[5:]).query_domain("kuscia-system")
+        KusciaClient(endpoint=endpoint, cert_dir=master.credential_ref[5:], domain_id=master.domain_id).ping()
         master.status = "connected"; master.last_error = None
         result = {"ok": True}
     except Exception as exc:
@@ -212,6 +219,18 @@ def delete_master(
     db: Session = Depends(get_db),
 ) -> dict:
     master = _get_or_404(db, master_id)
+    credential_dir = None
+    if master.credential_ref and master.credential_ref.startswith("file:"):
+        credential_dir = Path(master.credential_ref[5:])
     db.delete(master)
     db.commit()
+    # 数据库提交成功后，仅清理该 Master 在平台凭据根目录下的上传副本。
+    if credential_dir and settings.kuscia_credential_root:
+        root = Path(settings.kuscia_credential_root).resolve()
+        target = credential_dir.resolve()
+        if target.parent == root and target.name == master_id and target.is_dir():
+            for item in target.iterdir():
+                if item.is_file() or item.is_symlink():
+                    item.unlink()
+            target.rmdir()
     return _wrap(None)
