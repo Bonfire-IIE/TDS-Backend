@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, JSON, String, Text, func
+from sqlalchemy import DateTime, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -22,6 +22,7 @@ def _uuid() -> str:
 class Job(Base):
     """一次隐私计算作业。"""
     __tablename__ = "job"
+    __table_args__ = (UniqueConstraint("created_by", "idempotency_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     # 作业码（展示/追溯用）
@@ -31,6 +32,7 @@ class Job(Base):
     # 依据的数字合约（必须为 filed）
     contract_id: Mapped[str] = mapped_column(String(47))
     usage_record_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    usage_record_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     product_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # 选用的应用能力（= Kuscia AppImage name）
     app_image: Mapped[str] = mapped_column(String(128))
@@ -58,6 +60,8 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Structured control-plane failure summary; never contains raw connector logs.
     failure_info: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    obligations: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     created_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

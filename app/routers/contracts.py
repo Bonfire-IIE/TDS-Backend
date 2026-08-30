@@ -17,6 +17,10 @@ def _is_operator(user: dict) -> bool:
     return "operator" in user.get("roles", [])
 
 
+def _is_admin(user: dict) -> bool:
+    return bool({"operator", "supervisor"} & set(user.get("roles", [])))
+
+
 def _wrap(data) -> dict:
     return {"code": 0, "message": "ok", "data": data}
 
@@ -33,7 +37,7 @@ def request_contract(
     db: Session = Depends(get_db),
 ) -> dict:
     try:
-        c = svc.request(db, product_id, user["username"], _is_operator(user), body)
+        c = svc.request(db, product_id, user["username"], _is_admin(user), body)
     except svc.ContractError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     return _wrap(_out(c))

@@ -25,7 +25,8 @@ from app.models.job import Job
 from app.models.product import DataProduct
 from app.schemas.job import JobCreate
 from app.services import usage as usage_service
-from app.services.audit import append as audit_append
+from app.services.idempotency import execution_lock
+from app.services.audit import append as audit_append, contract_stream
 
 # --- PSI 引擎固定参数（复用 design/psi-job-reference.json 中实测配置）---
 _SPU_CONFIG = json.dumps({
@@ -138,6 +139,14 @@ def _map_state(kuscia_state: str | None) -> str:
 
 # ---------- 发起作业 ----------
 def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -> Job:
+    with execution_lock(db, f"job:{username}", body.idempotency_key):
+        return _create_job_locked(db, username, is_operator, body)
+
+
+def _create_job_locked(db: Session, username: str, is_operator: bool, body: JobCreate) -> Job:
+    existing = db.scalar(select(Job).where(Job.created_by == username, Job.idempotency_key == body.idempotency_key))
+    if existing:
+        return existing
     # ① 合约：必须已备案(filed)
     c = db.get(DigitalContract, body.contract_id)
     if not c:
@@ -159,8 +168,8 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
         raise JobError(f"应用能力 {body.app_image} 已下架", 409)
 
     product = db.get(DataProduct, c.product_id)
-    if product and product.allowed_appimages and body.app_image not in product.allowed_appimages:
-        raise JobError(f"应用 {body.app_image} 不在产品允许的能力列表内", 400)
+    if c.allowed_appimages and body.app_image not in c.allowed_appimages:
+        raise JobError(f"应用 {body.app_image} 不在合约允许的能力列表内", 403)
 
     # ③ 供/用连接器与各自 Kuscia domain
     provider = db.get(Connector, c.provider_connector_id)
@@ -172,10 +181,10 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
 
     # 使用控制必须发生在建路由、授权和提交作业等数据面副作用之前。
     try:
-        usage_record = usage_service.authorize_and_reserve(
-            db, c, username, consumer.id, action="process",
-            exec_env=app.capability, app_image=body.app_image,
-        )
+        usage_records = usage_service.authorize_and_reserve_actions(db, c, username, consumer.id, [{
+            "exec_env": app.capability, "app_image": body.app_image,
+            "operations": app.operations or ["process"], "uc_capabilities": app.uc_capabilities or [],
+        }])
     except usage_service.UsageError as e:
         raise JobError(e.message, e.status_code) from e
 
@@ -187,7 +196,7 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
         kc.create_cluster_route(provider_domain, consumer_domain, dst_host=prefix + consumer_domain)
         kc.create_cluster_route(consumer_domain, provider_domain, dst_host=prefix + provider_domain)
     except KusciaError as e:
-        usage_service.release(db, usage_record.id, f"建立连接器路由失败: {e}")
+        usage_service.release_many(db, usage_records, f"建立连接器路由失败: {e}")
         raise JobError(f"建立连接器路由失败: {e}", 502) from e
 
     # ⑤ SecretFlow PSI 需要双向 DomainDataGrant；自包含/自管输入应用可显式关闭。
@@ -197,7 +206,7 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
             kc.create_domaindatagrant(provider_domain, body.input_provider_domaindata_id, consumer_domain)
             kc.create_domaindatagrant(consumer_domain, body.input_consumer_domaindata_id, provider_domain)
         except KusciaError as e:
-            usage_service.release(db, usage_record.id, f"建立数据授权失败: {e}")
+            usage_service.release_many(db, usage_records, f"建立数据授权失败: {e}")
             raise JobError(f"建立数据授权失败: {e}", 502) from e
 
     # ⑥ 组装 task。自定义 AppImage 可声明角色和输入配置；否则走 SecretFlow PSI。
@@ -239,7 +248,7 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
     try:
         kc.create_job(job_dict)
     except KusciaError as e:
-        usage_service.release(db, usage_record.id, f"提交 Kuscia 作业失败: {e}")
+        usage_service.release_many(db, usage_records, f"提交 Kuscia 作业失败: {e}")
         raise JobError(f"提交 Kuscia 作业失败: {e}", 502) from e
 
     # ⑧ 落库（中心化无审批，直接 running）
@@ -247,7 +256,8 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
         job_code=_new_job_code(),
         name=body.name or f"{c.name}-PSI",
         contract_id=c.contract_id,
-        usage_record_id=usage_record.id,
+        usage_record_id=usage_records[0].id if usage_records else None,
+        usage_record_ids=[r.id for r in usage_records],
         product_id=c.product_id,
         app_image=body.app_image,
         initiator_connector_id=provider.id,
@@ -262,13 +272,15 @@ def create_job(db: Session, username: str, is_operator: bool, body: JobCreate) -
         status="running",
         result_domaindata_id=out_id,
         result_uri=out_uri,
+        obligations={r.action: r.obligations or [] for r in usage_records},
+        idempotency_key=body.idempotency_key,
         created_by=username,
     )
     db.add(job)
     db.flush()
     job_id = job.id
-    audit_append(db, event_type="job.submitted", stream_id=f"job:{job.id}", resource_type="job", resource_id=job.id, actor={"subject": username}, payload={"contract_id": c.contract_id, "app_image": body.app_image, "kuscia_job_id": kuscia_job_id, "usage_record_id": usage_record.request_id})
-    usage_service.consume(db, usage_record.id, job_id)
+    audit_append(db, event_type="job.submitted", stream_id=contract_stream(c.contract_id), resource_type="job", resource_id=job.id, actor={"subject": username}, payload={"contract_id": c.contract_id, "app_image": body.app_image, "kuscia_job_id": kuscia_job_id, "usage_record_ids": [r.request_id for r in usage_records], "idempotency_key": body.idempotency_key})
+    usage_service.consume_many(db, usage_records, job_id)
     db.refresh(job)
     return job
 
@@ -308,9 +320,10 @@ def sync_status(db: Session, job: Job) -> Job:
     elif new_status == "succeeded":
         job.error = None
         job.failure_info = None
-        audit_append(db, event_type="job.completed", stream_id=f"job:{job.id}", resource_type="job", resource_id=job.id, payload={"kuscia_job_id": job.kuscia_job_id, "status": new_status})
+        audit_append(db, event_type="job.completed", stream_id=contract_stream(job.contract_id), resource_type="job", resource_id=job.id, payload={"contract_id": job.contract_id, "kuscia_job_id": job.kuscia_job_id, "status": new_status})
     if new_status == "failed":
-        audit_append(db, event_type="job.failed", stream_id=f"job:{job.id}", resource_type="job", resource_id=job.id, payload={"kuscia_job_id": job.kuscia_job_id, "error": job.error})
+        audit_append(db, event_type="job.failed", stream_id=contract_stream(job.contract_id), resource_type="job", resource_id=job.id, payload={"contract_id": job.contract_id, "kuscia_job_id": job.kuscia_job_id, "error": job.error})
+        usage_service.compensate_many(db, job.usage_record_ids or ([job.usage_record_id] if job.usage_record_id else []), f"作业运行失败: {state}")
         # 结果 DomainData/URI 在发起时已按输出配置确定
     db.commit()
     db.refresh(job)

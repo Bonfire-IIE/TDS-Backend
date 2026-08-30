@@ -17,6 +17,7 @@ class JobCreate(BaseModel):
     join_keys: list[str] = Field(default_factory=lambda: ["id"])
     # 可选作业名（缺省用合约名派生）
     name: str | None = None
+    idempotency_key: str = Field(..., min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
 class JobOut(BaseModel):
@@ -25,6 +26,7 @@ class JobOut(BaseModel):
     name: str
     contract_id: str
     usage_record_id: str | None
+    usage_record_ids: list | None = None
     product_id: str | None
     app_image: str
     initiator_connector_id: str
@@ -41,8 +43,10 @@ class JobOut(BaseModel):
     result_uri: str | None
     error: str | None
     failure_info: dict | None
+    obligations: dict | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime
+    idempotency_key: str | None = None
 
     model_config = {"from_attributes": True}

@@ -11,6 +11,7 @@ ACTIONS = {
     "transform", "access", "read", "reproduce", "storage",
     "download", "process", "jointDevelop", "export", "grantUse",
 }
+OBLIGATIONS = {"ephemeral", "watermark", "no_download", "no_export"}
 
 
 class TimeWindow(BaseModel):
@@ -33,6 +34,7 @@ class Policy(BaseModel):
     type: Literal["allow", "prohibit"]
     actions: list[str] = Field(default_factory=list)
     constraints: Constraints | None = None
+    obligations: list[str] = Field(default_factory=list)
 
     @field_validator("actions")
     @classmethod
@@ -41,6 +43,14 @@ class Policy(BaseModel):
         if bad:
             raise ValueError(f"非法操作 {bad}，仅允许 {sorted(ACTIONS)}")
         return v
+
+    @field_validator("obligations")
+    @classmethod
+    def _valid_obligations(cls, v: list[str]) -> list[str]:
+        bad = [item for item in v if item not in OBLIGATIONS]
+        if bad:
+            raise ValueError(f"非法义务 {bad}，仅允许 {sorted(OBLIGATIONS)}")
+        return list(dict.fromkeys(v))
 
 
 class ProductCreate(BaseModel):

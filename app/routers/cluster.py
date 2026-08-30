@@ -4,20 +4,24 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.security import require_roles
 from app.integrations.kuscia import KusciaError, get_kuscia_client
 from app.models.connector import Connector
 
 router = APIRouter(prefix="/cluster", tags=["cluster"])
+admin_user = require_roles("operator", "supervisor")
 
 
 @router.get("/status")
-def cluster_status(db: Session = Depends(get_db)) -> dict:
+def cluster_status(
+    user: dict = Depends(admin_user),
+    db: Session = Depends(get_db),
+) -> dict:
     result: dict = {"kusciaApi": "up", "domains": []}
-    domain_ids = list(db.scalars(
-        select(Connector.kuscia_domain_id)
-        .where(Connector.deleted_at.is_(None), Connector.status == "approved")
-        .order_by(Connector.kuscia_domain_id)
-    ))
+    connector_query = select(Connector.kuscia_domain_id).where(
+        Connector.deleted_at.is_(None), Connector.status == "approved"
+    )
+    domain_ids = list(db.scalars(connector_query.order_by(Connector.kuscia_domain_id)))
     try:
         # 客户端构造本身可能因未配置 Master / 未完成迁移而失败；集群概览应
         # 返回可展示的 down 状态，而非让整个 API 变成 500。

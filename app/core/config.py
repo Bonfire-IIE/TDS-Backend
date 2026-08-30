@@ -9,7 +9,16 @@ class Settings(BaseSettings):
 
     app_name: str = "Bonfire-TDS Backend"
     api_prefix: str = "/api/v1"
-    debug: bool = True
+    # API 错误响应不得包含堆栈、SQL、凭据或内部路径；开发时也应显式 DEBUG=true 才开启。
+    debug: bool = False
+    # 一键切换传输模式：http（开发默认）/ https（生产，经 TLS 反代）。
+    transport_mode: str = "http"
+    # 旧部署兼容开关；新部署优先设置 TRANSPORT_MODE=https。
+    require_https: bool = False
+
+    @property
+    def https_enabled(self) -> bool:
+        return self.transport_mode.lower() == "https" or self.require_https
 
     # 数据存储（k3s NodePort，经 127.0.0.1 访问）
     database_url: str = ""

@@ -64,6 +64,7 @@ class CatalogOut(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: datetime
+    deletable: bool = False
 
     model_config = {"from_attributes": True}
 

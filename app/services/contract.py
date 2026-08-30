@@ -14,7 +14,7 @@ from app.models.connector import Connector
 from app.models.contract import ContractParty, DigitalContract, NegotiationHistory
 from app.models.product import DataProduct
 from app.schemas.contract import ContractRequest, ProposeRequest
-from app.services.audit import append as audit_append
+from app.services.audit import append as audit_append, contract_stream
 
 
 class ContractError(Exception):
@@ -129,8 +129,10 @@ def _new_contract_id(db: Session) -> str:
 
 # ---------- 用例 ----------
 def request(
-    db: Session, product_id: str, username: str, is_operator: bool, body: ContractRequest
+    db: Session, product_id: str, username: str, is_admin: bool, body: ContractRequest
 ) -> DigitalContract:
+    if is_admin:
+        raise ContractError("管理员不可申请使用数据产品，请使用普通参与方账户操作", 403)
     product = db.get(DataProduct, product_id)
     if not product:
         raise ContractError("产品不存在", 404)
@@ -140,7 +142,7 @@ def request(
     consumer = db.get(Connector, body.consumer_connector_id)
     if not consumer:
         raise ContractError("用数方连接器不存在", 404)
-    if not is_operator and consumer.created_by != username:
+    if consumer.created_by != username:
         raise ContractError("只能使用自己的连接器申请", 403)
     if consumer.status != "approved":
         raise ContractError("用数方连接器未审批通过", 409)
@@ -159,6 +161,7 @@ def request(
         consumer_connector_id=consumer.id,
         mode=product.transaction_mode,
         created_by=username,
+        allowed_appimages=list(body.allowed_appimages if body.allowed_appimages is not None else (product.allowed_appimages or [])),
     )
     c.parties = [
         ContractParty(party_role="provider", connector_id=product.provider_connector_id, entity=provider_entity),
@@ -184,13 +187,12 @@ def request(
             [p.model_dump(by_alias=True) for p in body.policies]
             if body.policies is not None else baseline
         )
-        c.allowed_appimages = list(body.allowed_appimages if body.allowed_appimages is not None else (product.allowed_appimages or []))
         c.status = "negotiating"
         _append_history(db, c, op="propose", operator=username)
 
     db.add(c)
     # 审计事件与合约写入同一事务，Rekor 不可用不影响业务提交。
-    audit_append(db, event_type="contract.created", stream_id=f"contract:{c.contract_id}",
+    audit_append(db, event_type="contract.created", stream_id=contract_stream(c.contract_id),
                  resource_type="digital_contract", resource_id=c.contract_id,
                  actor={"subject": username}, payload={"product_id": c.product_id, "provider_connector_id": c.provider_connector_id, "consumer_connector_id": c.consumer_connector_id, "mode": c.mode, "status": c.status, "contract_hash": c.contract_hash})
     db.commit()
@@ -244,7 +246,7 @@ def propose(
         p.signature_hash = None
         p.signed_at = None
     _append_history(db, c, op="propose", operator=username)
-    audit_append(db, event_type="contract.proposed", stream_id=f"contract:{c.contract_id}", resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status, "policies_hash": _sha256(_canonical(c.policies or []))})
+    audit_append(db, event_type="contract.proposed", stream_id=contract_stream(c.contract_id), resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status, "policies_hash": _sha256(_canonical(c.policies or []))})
     db.commit()
     db.refresh(c)
     return c
@@ -276,7 +278,7 @@ def sign(db: Session, contract_id: str, username: str, is_operator: bool) -> Dig
         raise ContractError("您可代表的各方均已签署", 409)
     if all(p.signature_hash for p in c.parties):
         _file_signed(c)
-    audit_append(db, event_type="contract.signed", stream_id=f"contract:{c.contract_id}", resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status, "signed_roles": [p.party_role for p in c.parties if p.signature_hash], "contract_hash": c.contract_hash})
+    audit_append(db, event_type="contract.signed", stream_id=contract_stream(c.contract_id), resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status, "signed_roles": [p.party_role for p in c.parties if p.signature_hash], "contract_hash": c.contract_hash})
     db.commit()
     db.refresh(c)
     return c
@@ -290,7 +292,7 @@ def file(db: Session, contract_id: str, username: str, is_operator: bool) -> Dig
     if c.status != "signed":
         raise ContractError(f"当前状态 {c.status} 不可备案（需先 signed）", 409)
     _file_signed(c)
-    audit_append(db, event_type="contract.filed", stream_id=f"contract:{c.contract_id}", resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"contract_hash": c.contract_hash, "signature_hashes": [p.signature_hash for p in c.parties]})
+    audit_append(db, event_type="contract.filed", stream_id=contract_stream(c.contract_id), resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"contract_hash": c.contract_hash, "signature_hashes": [p.signature_hash for p in c.parties]})
     db.commit()
     db.refresh(c)
     return c
@@ -300,7 +302,7 @@ def terminate(db: Session, contract_id: str, username: str, is_operator: bool) -
     c = _get_or_404(db, contract_id)
     _require_actor(db, c, username, is_operator)
     c.status = "terminated"
-    audit_append(db, event_type="contract.terminated", stream_id=f"contract:{c.contract_id}", resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status})
+    audit_append(db, event_type="contract.terminated", stream_id=contract_stream(c.contract_id), resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status})
     db.commit()
     db.refresh(c)
     return c
@@ -310,7 +312,7 @@ def reject(db: Session, contract_id: str, username: str, is_operator: bool) -> D
     c = _get_or_404(db, contract_id)
     _require_actor(db, c, username, is_operator)
     c.status = "rejected"
-    audit_append(db, event_type="contract.rejected", stream_id=f"contract:{c.contract_id}", resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status})
+    audit_append(db, event_type="contract.rejected", stream_id=contract_stream(c.contract_id), resource_type="digital_contract", resource_id=c.contract_id, actor={"subject": username}, payload={"status": c.status})
     db.commit()
     db.refresh(c)
     return c

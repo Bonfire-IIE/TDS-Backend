@@ -16,7 +16,12 @@ contract_valid if {
   contract.status == "filed"
   input.subject.connector_id == contract.consumer_connector_id
   input.resource.product_id == contract.product_id
+  app_image_allowed
 }
+
+allowed_appimages := object.get(contract, "allowed_appimages", {})
+app_image_allowed if { count(allowed_appimages) == 0 }
+app_image_allowed if { allowed_appimages[input.resource.app_image] }
 
 constraint_ok(c) if {
   time_ok(c)

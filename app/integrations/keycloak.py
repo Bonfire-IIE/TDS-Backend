@@ -16,10 +16,20 @@ from app.core.config import settings
 
 
 class AuthError(Exception):
-    def __init__(self, message: str, status_code: int = 401) -> None:
+    def __init__(self, message: str, status_code: int = 401, code: str = "AUTH_FAILED", diagnostic: str | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        self.code = code
+        self.diagnostic = diagnostic
+
+
+def _keycloak_failure(action: str, response: httpx.Response) -> AuthError:
+    # 上游正文可能带 realm/client 信息，只进入服务端诊断，不回传浏览器。
+    diagnostic = f"status={response.status_code} body={response.text[:500]}"
+    if response.status_code in (401, 403):
+        return AuthError(f"身份服务拒绝{action}，请检查客户端配置", 502, "IDENTITY_CLIENT_REJECTED", diagnostic)
+    return AuthError(f"身份服务暂时无法完成{action}", 502, "IDENTITY_UPSTREAM_ERROR", diagnostic)
 
 
 @lru_cache
@@ -38,12 +48,17 @@ def password_login(username: str, password: str) -> dict:
         "password": password,
         "scope": "openid profile email",
     }
-    with httpx.Client(timeout=10.0, trust_env=False) as c:
-        resp = c.post(token_url, data=data)
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as c:
+            resp = c.post(token_url, data=data)
+    except httpx.TimeoutException as exc:
+        raise AuthError("身份服务响应超时，请稍后重试", 503, "IDENTITY_TIMEOUT", repr(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise AuthError("无法连接身份服务", 503, "IDENTITY_UNREACHABLE", repr(exc)) from exc
     if resp.status_code == 401:
         raise AuthError("用户名或密码错误")
     if resp.status_code != 200:
-        raise AuthError(f"登录失败: {resp.text[:200]}", status_code=502)
+        raise _keycloak_failure("登录", resp)
     return resp.json()
 
 
@@ -55,10 +70,15 @@ def _admin_token() -> str:
         "client_id": settings.keycloak_admin_client_id,
         "client_secret": settings.keycloak_admin_client_secret,
     }
-    with httpx.Client(timeout=10.0, trust_env=False) as c:
-        resp = c.post(token_url, data=data)
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as c:
+            resp = c.post(token_url, data=data)
+    except httpx.TimeoutException as exc:
+        raise AuthError("身份服务响应超时，请稍后重试", 503, "IDENTITY_TIMEOUT", repr(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise AuthError("无法连接身份服务", 503, "IDENTITY_UNREACHABLE", repr(exc)) from exc
     if resp.status_code != 200:
-        raise AuthError(f"获取管理令牌失败: {resp.text[:200]}", status_code=502)
+        raise _keycloak_failure("用户管理认证", resp)
     return resp.json()["access_token"]
 
 
@@ -83,12 +103,17 @@ def register_user(
         "attributes": {"verified": ["false"]},
     }
     headers = {"Authorization": f"Bearer {_admin_token()}", "Content-Type": "application/json"}
-    with httpx.Client(timeout=10.0, trust_env=False) as c:
-        resp = c.post(admin_url, json=payload, headers=headers)
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as c:
+            resp = c.post(admin_url, json=payload, headers=headers)
+    except httpx.TimeoutException as exc:
+        raise AuthError("身份服务响应超时，请稍后重试", 503, "IDENTITY_TIMEOUT", repr(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise AuthError("无法连接身份服务", 503, "IDENTITY_UNREACHABLE", repr(exc)) from exc
     if resp.status_code == 409:
         raise AuthError("用户名或邮箱已存在", status_code=409)
     if resp.status_code not in (201, 204):
-        raise AuthError(f"注册失败: {resp.text[:200]}", status_code=502)
+        raise _keycloak_failure("用户注册", resp)
     return resp.headers.get("Location", "").rsplit("/", 1)[-1]
 
 

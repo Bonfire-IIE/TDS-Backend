@@ -17,6 +17,8 @@ class UsageRecordOut(BaseModel):
     reason: str | None
     matched_policy_ids: list | None
     context: dict | None
+    obligations: list | None = None
+    obligation_status: dict | None = None
     created_at: datetime
     updated_at: datetime
 

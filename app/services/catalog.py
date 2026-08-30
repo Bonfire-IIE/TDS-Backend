@@ -129,7 +129,7 @@ def _resolve_datasource(db: Session, conn: Connector, datasource_id: str) -> tup
     return ds.kuscia_datasource_id, ds.id
 
 
-def _enrich(db: Session, row: DataCatalog) -> DataCatalog:
+def _enrich(db: Session, row: DataCatalog, username: str | None = None, is_admin: bool = False) -> DataCatalog:
     """按 datasource_id 补充数据源展示信息（名称/类型/uri），供 CatalogOut 序列化。"""
     name = type_ = uri = None
     if row.datasource_id and row.datasource_id != "default-data-source":
@@ -141,6 +141,8 @@ def _enrich(db: Session, row: DataCatalog) -> DataCatalog:
     row.datasource_name = name
     row.datasource_type = type_
     row.datasource_uri = uri
+    connector = db.get(Connector, row.provider_connector_id)
+    row.deletable = bool(is_admin or row.created_by == username or (connector and connector.created_by == username))
     return row
 
 
@@ -161,7 +163,7 @@ def search(db: Session, username: str, is_admin: bool, *, q: str | None = None,
         stmt = stmt.where(DataCatalog.resource_category == resource_category)
     if connector_id:
         stmt = stmt.where(DataCatalog.provider_connector_id == connector_id)
-    return [_enrich(db, r) for r in db.execute(stmt).scalars()]
+    return [_enrich(db, r, username, is_admin) for r in db.execute(stmt).scalars()]
 
 
 def get(db: Session, catalog_id: str) -> DataCatalog:
@@ -189,7 +191,8 @@ def delete_resource(db: Session, catalog_id: str, username: str, is_admin: bool)
     - 删除 Kuscia DomainData 失败则 502。
     """
     row = get(db, catalog_id)  # 已排除软删
-    if not (row.created_by == username or is_admin):
+    connector = db.get(Connector, row.provider_connector_id)
+    if not (row.created_by == username or is_admin or (connector and connector.created_by == username)):
         raise CatalogError("无权删除该资源", 403)
 
     # 引用检查：仍有未删除的数据产品引用该资源 -> 拦截
@@ -209,7 +212,11 @@ def delete_resource(db: Session, catalog_id: str, username: str, is_admin: bool)
                 domain_id=row.kuscia_domain_id, domaindata_id=row.kuscia_domaindata_id,
             )
         except KusciaError as e:
-            raise CatalogError(f"删除 Kuscia DomainData 失败: {e}", 502) from e
+            # 删除必须幂等：任务结束或人工清理后，底层 DomainData 可能已不存在，
+            # 此时仍应清理中心目录中的孤儿记录。其它 Kuscia 错误继续阻断删除。
+            low = str(e).lower()
+            if "not found" not in low and "not exist" not in low:
+                raise CatalogError(f"删除 Kuscia DomainData 失败: {e}", 502) from e
 
     row.deleted_at = func.now()
     db.commit()

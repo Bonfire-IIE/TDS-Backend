@@ -18,7 +18,23 @@ from app.core.config import settings
 
 
 class KusciaError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "KUSCIA_ERROR", diagnostic: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.diagnostic = diagnostic
+
+
+def _kuscia_request_error(exc: httpx.HTTPError) -> KusciaError:
+    if isinstance(exc, httpx.TimeoutException):
+        return KusciaError("Kuscia Master 响应超时，请检查节点状态和网络", code="KUSCIA_TIMEOUT", diagnostic=repr(exc))
+    if isinstance(exc, httpx.ConnectError):
+        return KusciaError("无法连接 Kuscia Master，请检查地址、端口和网络", code="KUSCIA_UNREACHABLE", diagnostic=repr(exc))
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (401, 403):
+            return KusciaError("Kuscia Master 拒绝认证，请检查证书和令牌", code="KUSCIA_AUTH_FAILED", diagnostic=repr(exc))
+        return KusciaError(f"Kuscia Master 返回异常状态（HTTP {status}）", code="KUSCIA_UPSTREAM_ERROR", diagnostic=repr(exc))
+    return KusciaError("Kuscia Master 请求失败", diagnostic=repr(exc))
 
 
 class ChunkedJsonParser:
@@ -80,8 +96,11 @@ class KusciaClient:
             resp = self._client.post(path, json=payload)
             resp.raise_for_status()
         except httpx.HTTPError as e:  # 网络/TLS/HTTP 错误
-            raise KusciaError(str(e)) from e
-        data = resp.json()
+            raise _kuscia_request_error(e) from e
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise KusciaError("Kuscia Master 返回了无法解析的响应", code="KUSCIA_INVALID_RESPONSE", diagnostic=repr(e)) from e
         status = data.get("status", {})
         if status.get("code") not in (0, None):
             raise KusciaError(status.get("message", "kuscia api error"))

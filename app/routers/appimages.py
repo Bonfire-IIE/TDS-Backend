@@ -17,6 +17,10 @@ def _is_operator(user: dict) -> bool:
     return "operator" in user.get("roles", [])
 
 
+def _is_admin(user: dict) -> bool:
+    return bool({"operator", "supervisor"} & set(user.get("roles", [])))
+
+
 def _wrap(data) -> dict:
     return {"code": 0, "message": "ok", "data": data}
 
@@ -29,7 +33,7 @@ def _out(r: AppImage) -> AppImageOut:
 def list_appimages(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
-    items = svc.list_appimages(db, user["username"], _is_operator(user))
+    items = svc.list_appimages(db, user["username"], _is_admin(user))
     return _wrap([_out(r) for r in items])
 
 
@@ -77,7 +81,7 @@ def delist_appimage(
     db: Session = Depends(get_db),
 ) -> dict:
     try:
-        r = svc.delist(db, appimage_id, user["username"], _is_operator(user))
+        r = svc.delist(db, appimage_id, user["username"], _is_admin(user))
     except svc.AppImageError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     return _wrap(_out(r))

@@ -6,6 +6,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.models.audit import AuditEvent, AuditOutbox, AuditAnchor
 
+def contract_stream(contract_id: str) -> str:
+    """一份合约及其派生行为共用的唯一审计链。"""
+    if not contract_id:
+        raise ValueError("contract_id 不能为空")
+    return f"contract:{contract_id}"
+
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -18,9 +24,9 @@ def append(db: Session, *, event_type: str, stream_id: str, payload: dict, actor
     envelope = {"schema_version": "1.0", "event_id": event_id, "event_type": event_type, "stream_id": stream_id, "sequence": sequence, "actor": actor, "resource_type": resource_type, "resource_id": resource_id, "payload": payload, "occurred_at": occurred.isoformat()}
     payload_hash = hashlib.sha256(_canonical(payload).encode()).hexdigest()
     current = hashlib.sha256(f"{stream_id}:{sequence}:{previous}:{payload_hash}".encode()).hexdigest()
-    row = AuditEvent(id=event_id, event_id=event_id, event_type=event_type, stream_id=stream_id, sequence=sequence, actor=actor, resource_type=resource_type, resource_id=resource_id, payload=envelope, payload_hash=payload_hash, previous_hash=previous, current_hash=current, occurred_at=occurred)
+    row = AuditEvent(id=event_id, event_id=event_id, event_type=event_type, stream_id=stream_id, sequence=sequence, actor=actor, resource_type=resource_type, resource_id=resource_id, payload=envelope, payload_hash=payload_hash, previous_hash=previous, current_hash=current, occurred_at=occurred, created_at=occurred)
     db.add(row)
-    db.add(AuditOutbox(id=str(uuid.uuid4()), event_id=event_id, status="pending"))
+    db.add(AuditOutbox(id=str(uuid.uuid4()), event_id=event_id, status="pending", created_at=occurred))
     db.flush()
     return row
 

@@ -4,9 +4,12 @@ from urllib.parse import urlparse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from app.core.config import settings
+from app.core.identifier import gen_data_code
 from app.integrations.kuscia import KusciaError, get_kuscia_client
 from app.models import AppImage, Connector, DataCatalog, DataGrant, DataLineage, DataProduct, DataSource, DigitalContract, Project, ProjectRun, WorkflowApproval, WorkflowVersion
 from app.services import usage
+from app.services.idempotency import execution_lock
+from app.services.audit import append as audit_append, contract_stream
 
 class ProjectError(Exception):
     def __init__(self,message,status_code=400): super().__init__(message); self.message=message; self.status_code=status_code
@@ -53,9 +56,10 @@ def available_domain_data(db, project, username: str, operator: bool = False):
 def _ports(app, direction):
     return {x.get("name"):x for x in ((app.io_schema or {}).get(direction,[]) or []) if x.get("name")}
 
-def get(db,id,username,operator):
+def get(db,id,username,is_admin):
+    if is_admin: raise ProjectError("管理员不可进入项目工作台",403)
     p=db.get(Project,id)
-    if not p or not db.execute(_visible(db,username,operator).where(Project.id==id)).scalar_one_or_none(): raise ProjectError("项目不存在或无权访问",404)
+    if not p or not db.execute(_visible(db,username,False).where(Project.id==id)).scalar_one_or_none(): raise ProjectError("项目不存在或无权访问",404)
     return p
 
 def create(db,username,operator,body):
@@ -63,7 +67,8 @@ def create(db,username,operator,body):
     if not c or c.status!="filed": raise ProjectError("只能基于已备案合约创建项目",409)
     if not operator and not _owned(db,c.consumer_connector_id,username): raise ProjectError("仅合约用数方或运营方可创建项目",403)
     p=Project(name=body.name,description=body.description,contract_id=c.contract_id,initiator_connector_id=c.consumer_connector_id,status="draft",created_by=username)
-    db.add(p)
+    db.add(p); db.flush()
+    audit_append(db,event_type="project.created",stream_id=contract_stream(c.contract_id),resource_type="project",resource_id=p.id,actor={"subject":username},payload={"contract_id":c.contract_id,"project_id":p.id,"status":p.status})
     db.commit(); db.refresh(p); return p
 
 def validate_workflow(db,project,workflow):
@@ -181,7 +186,9 @@ def submit(db,p,username,workflow):
     contract=db.get(DigitalContract,p.contract_id)
     if contract and contract.mode=="accept":
         db.add(WorkflowApproval(workflow_version_id=row.id,connector_id=contract.provider_connector_id,decision="approved",comment="提案-接受模式：数据提供方默认同意",decided_by="system"))
-    p.current_version=version; p.status="pending_approval"; db.commit(); db.refresh(row); return row
+    p.current_version=version; p.status="pending_approval"
+    audit_append(db,event_type="project.workflow.submitted",stream_id=contract_stream(p.contract_id),resource_type="workflow_version",resource_id=row.id,actor={"subject":username},payload={"contract_id":p.contract_id,"project_id":p.id,"version":version,"workflow_hash":digest,"status":row.status})
+    db.commit(); db.refresh(row); return row
 
 def approve(db,p,username,operator,body):
     parties={conn.id:conn for conn in project_domains(db,p)}
@@ -204,6 +211,7 @@ def approve(db,p,username,operator,body):
     if body.decision=="rejected": version.status=p.status="rejected"
     elif {x.connector_id for x in approvals if x.decision=="approved"}==set(parties):
         version.status=p.status="approved"
+    audit_append(db,event_type="project.workflow.approved" if body.decision=="approved" else "project.workflow.rejected",stream_id=contract_stream(p.contract_id),resource_type="workflow_version",resource_id=version.id,actor={"subject":username},payload={"contract_id":p.contract_id,"project_id":p.id,"version":version.version,"connector_id":cid,"decision":body.decision,"status":version.status})
     db.commit(); return version
 
 def _render(value, context):
@@ -385,7 +393,13 @@ def revoke_grants_for_run(db, run_id):
         g.status="revoked"; g.revoked_at=func.now()
     db.commit()
 
-def run(db,p,username):
+def run(db,p,username,idempotency_key):
+    with execution_lock(db, f"project:{p.id}", idempotency_key):
+        return _run_locked(db,p,username,idempotency_key)
+
+def _run_locked(db,p,username,idempotency_key):
+    existing=db.scalar(select(ProjectRun).where(ProjectRun.project_id==p.id,ProjectRun.idempotency_key==idempotency_key))
+    if existing: return existing
     if p.created_by!=username or p.status not in ("approved","completed","failed"): raise ProjectError("项目尚未全部审核通过或无执行权限",409)
     version=db.scalar(select(WorkflowVersion).where(WorkflowVersion.project_id==p.id,WorkflowVersion.version==p.current_version))
     # 里程碑①：先校验节点互联，链路未全部连通不得执行。
@@ -404,35 +418,38 @@ def run(db,p,username):
         seen.add(name)
         app=db.scalar(select(AppImage).where(AppImage.name==name,AppImage.status=="registered"))
         if not app: raise ProjectError(f"节点 AppImage {name} 不存在或已下架",409)
-        if product and product.allowed_appimages and name not in product.allowed_appimages:
-            raise ProjectError(f"应用 {name} 不在产品允许的能力列表内",400)
-        apps.append({"exec_env":app.capability,"app_image":name,"operations":app.operations or ["process"]})
+        if c.allowed_appimages and name not in c.allowed_appimages:
+            raise ProjectError(f"应用 {name} 不在合约允许的能力列表内",403)
+        apps.append({"exec_env":app.capability,"app_image":name,"operations":app.operations or ["process"],"uc_capabilities":app.uc_capabilities or []})
     # 操作符合性：AppImage 声明的每个操作都必须在合约授权范围内（只读校验，不动计数器）
     try:
         for ai in apps:
-            denied=usage.check_operations(c,username,p.initiator_connector_id,ai["operations"],ai["exec_env"],ai["app_image"])
-            if denied: raise ProjectError(f"应用 {ai['app_image']} 声明的操作 {denied} 未获合约授权",403)
+            denied=usage.check_operations(db,c,username,p.initiator_connector_id,ai["operations"],ai["exec_env"],ai["app_image"])
+            if denied:
+                details = "；".join(f"{x['action']}：{x['reason']}" for x in denied)
+                raise ProjectError(f"应用 {ai['app_image']} 不满足合约授权条件：{details}",403)
     except usage.UsageError as e: raise ProjectError(e.message,e.status_code) from e
-    # 使用次数(count)仍只在 process 上预留/消费
-    try: usage_record=usage.authorize_and_reserve_workflow(db,c,username,p.initiator_connector_id,"process",apps)
+    try: usage_records=usage.authorize_and_reserve_actions(db,c,username,p.initiator_connector_id,apps)
     except usage.UsageError as e: raise ProjectError(e.message,e.status_code) from e
     # 建 CDR（幂等再确认）；失败释放预占。
     try: ensure_connectivity(db,p)
-    except ProjectError as e: usage.release(db,usage_record.id,f"建立节点互联失败: {e.message}"); raise
+    except ProjectError as e: usage.release_many(db,usage_records,f"建立节点互联失败: {e.message}"); raise
     job,compiled_workflow=compile_job(db,version,initiator.kuscia_domain_id,p.id,run_id)
     # 建 grant；失败释放预占。
     plan=_grant_plan(db,version.workflow,p)
     try: ensure_grants_for_run(db,run_id,plan)
-    except ProjectError as e: usage.release(db,usage_record.id,f"建立数据授权失败: {e.message}"); raise
+    except ProjectError as e: usage.release_many(db,usage_records,f"建立数据授权失败: {e.message}"); raise
     # 提交 KusciaJob；失败释放预占并回收授权。
     try: get_kuscia_client().create_job(job)
     except KusciaError as e:
-        usage.release(db,usage_record.id,f"提交 KusciaJob 失败: {e}"); revoke_grants_for_run(db,run_id)
+        usage.release_many(db,usage_records,f"提交 KusciaJob 失败: {e}"); revoke_grants_for_run(db,run_id)
         raise ProjectError(f"提交 KusciaJob 失败: {e}",502) from e
-    snapshot={"compiler_version":"project-dag/v2","workflow_hash":version.workflow_hash,"kuscia_job":job,"usage_record_id":usage_record.id,"workflow":compiled_workflow}
-    row=ProjectRun(id=run_id,project_id=p.id,workflow_version_id=version.id,kuscia_job_id=job["job_id"],status="running",job_snapshot=snapshot,created_by=username)
-    db.add(row); p.status="running"; db.commit(); db.refresh(row)
-    usage.consume(db,usage_record.id,run_id)
+    snapshot={"compiler_version":"project-dag/v2","workflow_hash":version.workflow_hash,"kuscia_job":job,"usage_record_ids":[r.id for r in usage_records],"obligations":{r.action:r.obligations or [] for r in usage_records},"workflow":compiled_workflow}
+    row=ProjectRun(id=run_id,project_id=p.id,workflow_version_id=version.id,kuscia_job_id=job["job_id"],status="running",job_snapshot=snapshot,created_by=username,idempotency_key=idempotency_key)
+    db.add(row); p.status="running"; db.flush()
+    audit_append(db,event_type="project.run.submitted",stream_id=contract_stream(p.contract_id),resource_type="project_run",resource_id=row.id,actor={"subject":username},payload={"contract_id":p.contract_id,"project_id":p.id,"run_id":row.id,"workflow_version_id":version.id,"kuscia_job_id":row.kuscia_job_id,"usage_record_ids":[r.request_id for r in usage_records],"idempotency_key":idempotency_key})
+    db.commit(); db.refresh(row)
+    usage.consume_many(db,usage_records,run_id)
     return row
 
 def sync_run(db,p,row):
@@ -445,8 +462,11 @@ def sync_run(db,p,row):
     if row.status=="failed": row.failure_info={**summary,"message":summary["message"] or "执行失败","code":state}
     elif row.status=="running": row.failure_info=summary
     else: row.failure_info=None
-    if row.status in ("succeeded","failed"): p.status="completed" if row.status=="succeeded" else "failed"
+    if row.status in ("succeeded","failed"):
+        p.status="completed" if row.status=="succeeded" else "failed"
+        audit_append(db,event_type="project.run.completed" if row.status=="succeeded" else "project.run.failed",stream_id=contract_stream(p.contract_id),resource_type="project_run",resource_id=row.id,payload={"contract_id":p.contract_id,"project_id":p.id,"run_id":row.id,"kuscia_job_id":row.kuscia_job_id,"status":row.status,"failure_info":row.failure_info})
     db.commit()
+    if row.status=="failed": usage.compensate_many(db,(row.job_snapshot or {}).get("usage_record_ids") or [],f"项目运行失败: {state}")
     if row.status=="succeeded": _register_outputs(db,p,row)
     if row.status in ("succeeded","failed"): revoke_grants_for_run(db,row.id)  # 回收该 run 的授权（幂等、best-effort）
     db.refresh(row); return row
@@ -465,11 +485,13 @@ def _register_outputs(db,project,row):
             conn=db.scalar(select(Connector).where(Connector.kuscia_domain_id==b.get("domain_id")))
             if not conn: continue
             resource=DataCatalog(name=b.get("name") or f"{project.name}-{node['id']}-{b['port']}",description="项目作业派生数据",
+                tds_code=gen_data_code("resource", settings.tds_default_subject_code, settings.tds_default_region_industry),
                 kind="resource",data_type=b.get("data_type","table"),provider_connector_id=conn.id,kuscia_domain_id=conn.kuscia_domain_id,
                 kuscia_domaindata_id=dd,security_level=b.get("security_level","3"),columns=b.get("columns") or [],
                 relative_uri=b.get("relative_uri") or f"projects/{project.id}/{row.id}/{node['id']}-{b['port']}.csv",
                 datasource_id=b.get("datasource_id","default-data-source"),status="registered",created_by=row.created_by)
             db.add(resource); db.flush()
+            audit_append(db,event_type="project.output.registered",stream_id=contract_stream(project.contract_id),resource_type="data_catalog",resource_id=resource.id,actor={"subject":row.created_by},payload={"contract_id":project.contract_id,"project_id":project.id,"run_id":row.id,"resource_id":resource.id,"tds_code":resource.tds_code,"kuscia_domaindata_id":dd,"workflow_node_id":node["id"],"output_port":b["port"]})
             for source in inputs: db.add(DataLineage(output_resource_id=resource.id,input_resource_id=source.id,project_id=project.id,
                 project_run_id=row.id,workflow_node_id=node["id"],output_port=b["port"],app_image_name=node["app_image"]))
     db.commit()

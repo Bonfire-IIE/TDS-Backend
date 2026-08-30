@@ -46,6 +46,7 @@ class WorkflowApproval(Base):
 
 class ProjectRun(Base):
     __tablename__ = "project_run"
+    __table_args__ = (UniqueConstraint("project_id", "idempotency_key"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_id)
     project_id: Mapped[str] = mapped_column(String(36), ForeignKey("project.id", ondelete="CASCADE"), index=True)
     workflow_version_id: Mapped[str] = mapped_column(String(36))
@@ -53,6 +54,7 @@ class ProjectRun(Base):
     status: Mapped[str] = mapped_column(String(24), default="running")
     job_snapshot: Mapped[dict] = mapped_column(JSON)
     failure_info: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

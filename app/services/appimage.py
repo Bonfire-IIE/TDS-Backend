@@ -132,8 +132,9 @@ def register(db: Session, username: str, is_operator: bool, body: AppImageCreate
     ports={direction:{p.get("name") for p in ((body.io_schema or {}).get(direction) or []) if isinstance(p,dict)} for direction in ("inputs","outputs")}
     if any(None in names or len(names)!=len((body.io_schema or {}).get(direction) or []) for direction,names in ports.items()):
         raise AppImageError("I/O 端口必须有唯一的 name",400)
-    if ports["inputs"] and body.task_input_template is None:
-        raise AppImageError("声明输入端口的应用必须提供 task_input_template",400)
+    # task_input_template 是平台工作流的可选适配层，不是 AppImage 的必需字段。
+    # 应用开发商可以在自身镜像/配置中定义输入入口；没有平台模板时，项目运行阶段
+    # 继续使用节点提供的 task_input_config（见 services/project.py）。
     def scan(value):
         if isinstance(value,dict):
             for child in value.values(): scan(child)
@@ -219,11 +220,11 @@ def register(db: Session, username: str, is_operator: bool, body: AppImageCreate
 
 
 # ---- 检索 ----
-def list_appimages(db: Session, username: str, is_operator: bool) -> list[AppImage]:
+def list_appimages(db: Session, username: str, is_admin: bool) -> list[AppImage]:
     seed_builtin(db)
     stmt = select(AppImage).order_by(AppImage.created_at.desc())
     # 可见性：已登记对所有人可见；下架的仅属主/运营方可见
-    if not is_operator:
+    if not is_admin:
         stmt = stmt.where(
             or_(AppImage.status == "registered", AppImage.created_by == username)
         )
@@ -237,12 +238,12 @@ def get(db: Session, appimage_id: str) -> AppImage:
     return row
 
 
-def delist(db: Session, appimage_id: str, username: str, is_operator: bool) -> AppImage:
+def delist(db: Session, appimage_id: str, username: str, is_admin: bool) -> AppImage:
     row = get(db, appimage_id)
     # 内置能力受保护，不可下架
     if row.scope == "builtin":
         raise AppImageError("内置应用能力受保护，不可下架", 403)
-    if not is_operator and row.created_by != username:
+    if not is_admin and row.created_by != username:
         raise AppImageError("无权操作", 403)
     row.status = "delisted"
     db.commit()

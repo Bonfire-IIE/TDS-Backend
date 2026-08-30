@@ -4,11 +4,12 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.security import get_current_user
 from app.models import ProjectRun,WorkflowApproval,WorkflowVersion
-from app.schemas.project import ApprovalOut,ApprovalRequest,AvailableDomainDataOut,DomainOut,ProjectCreate,ProjectOut,RunOut,VersionOut,WorkflowSubmit
+from app.schemas.project import ApprovalOut,ApprovalRequest,AvailableDomainDataOut,DomainOut,ProjectCreate,ProjectOut,RunCreate,RunOut,VersionOut,WorkflowSubmit
 from app.services import project as svc
 
 router=APIRouter(prefix="/projects",tags=["projects"])
 def op(u): return "operator" in u.get("roles",[])
+def admin(u): return bool({"operator","supervisor"} & set(u.get("roles",[])))
 def wrap(x): return {"code":0,"message":"ok","data":x}
 def guard(fn):
     try: return fn()
@@ -16,7 +17,7 @@ def guard(fn):
 
 @router.get("")
 def listing(user=Depends(get_current_user),db:Session=Depends(get_db)):
-    return wrap([ProjectOut.model_validate(x) for x in db.scalars(svc._visible(db,user["username"],op(user)))])
+    return wrap([ProjectOut.model_validate(x) for x in db.scalars(svc._visible(db,user["username"],admin(user)))])
 
 @router.post("",status_code=201)
 def create(body:ProjectCreate,user=Depends(get_current_user),db:Session=Depends(get_db)):
@@ -32,35 +33,35 @@ def detail_data(db,p):
 
 @router.get("/{project_id}")
 def detail(project_id:str,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); return wrap(detail_data(db,p))
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); return wrap(detail_data(db,p))
 
 @router.post("/{project_id}/workflows")
 def workflow(project_id:str,body:WorkflowSubmit,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); row=guard(lambda:svc.submit(db,p,user["username"],body.workflow)); return wrap(VersionOut.model_validate(row))
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); row=guard(lambda:svc.submit(db,p,user["username"],body.workflow)); return wrap(VersionOut.model_validate(row))
 
 @router.post("/{project_id}/approvals")
 def approval(project_id:str,body:ApprovalRequest,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); guard(lambda:svc.approve(db,p,user["username"],op(user),body)); return wrap(detail_data(db,p))
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); guard(lambda:svc.approve(db,p,user["username"],op(user),body)); return wrap(detail_data(db,p))
 
 @router.get("/{project_id}/connectivity")
 def connectivity(project_id:str,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); return wrap(svc.connectivity_status(db,p))
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); return wrap(svc.connectivity_status(db,p))
 
 @router.get("/{project_id}/available-domain-data")
 def available_domain_data(project_id:str,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user)))
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user)))
     return wrap([AvailableDomainDataOut(**x) for x in svc.available_domain_data(db,p,user["username"],op(user))])
 
 @router.post("/{project_id}/connectivity/ensure")
 def connectivity_ensure(project_id:str,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); return wrap(guard(lambda:svc.ensure_connectivity(db,p)))
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); return wrap(guard(lambda:svc.ensure_connectivity(db,p)))
 
 @router.post("/{project_id}/runs",status_code=201)
-def run(project_id:str,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); return wrap(RunOut.model_validate(guard(lambda:svc.run(db,p,user["username"]))))
+def run(project_id:str,body:RunCreate,user=Depends(get_current_user),db:Session=Depends(get_db)):
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); return wrap(RunOut.model_validate(guard(lambda:svc.run(db,p,user["username"],body.idempotency_key))))
 
 @router.post("/{project_id}/runs/{run_id}/refresh")
 def refresh(project_id:str,run_id:str,user=Depends(get_current_user),db:Session=Depends(get_db)):
-    p=guard(lambda:svc.get(db,project_id,user["username"],op(user))); row=db.get(ProjectRun,run_id)
+    p=guard(lambda:svc.get(db,project_id,user["username"],admin(user))); row=db.get(ProjectRun,run_id)
     if not row or row.project_id!=p.id: raise HTTPException(404,"运行实例不存在")
     return wrap(RunOut.model_validate(svc.sync_run(db,p,row)))

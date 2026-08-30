@@ -9,6 +9,7 @@ from app.models.job import Job
 from app.models.product import DataProduct
 from app.models.usage import UsageCounter, UsageRecord
 from app.models.project import Project, WorkflowVersion, WorkflowApproval, ProjectRun, DataLineage
+from app.models.project_template import ProjectTemplate
 from app.models.data_grant import DataGrant
 from app.models.audit import AuditEvent, AuditOutbox, AuditAnchor
 from app.models.kuscia_master import KusciaMaster
@@ -27,7 +28,7 @@ __all__ = [
     "ContractTemplate",
     "UsageCounter",
     "UsageRecord",
-    "Project", "WorkflowVersion", "WorkflowApproval", "ProjectRun", "DataLineage",
+    "Project", "WorkflowVersion", "WorkflowApproval", "ProjectRun", "DataLineage", "ProjectTemplate",
     "DataGrant",
     "AuditEvent", "AuditOutbox", "AuditAnchor", "KusciaMaster",
 ]

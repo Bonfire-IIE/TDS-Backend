@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -29,7 +30,12 @@ def _exists(db: Session, **kw) -> bool:
 
 
 def apply(db: Session, username: str, body: ConnectorApply) -> Connector:
-    if _exists(db, kuscia_domain_id=body.kuscia_domain_id):
+    # 数据库唯一约束覆盖软删除行，不能只检查当前有效记录，否则历史软删除行会在
+    # commit 时触发未处理的 UniqueViolation，并把 SQL/堆栈暴露给调用端。
+    existing = db.scalar(select(Connector).where(
+        Connector.kuscia_domain_id == body.kuscia_domain_id
+    ))
+    if existing:
         raise ConnectorError(f"domain_id '{body.kuscia_domain_id}' 已被占用", 409)
     c = Connector(
         name=body.name,
@@ -43,7 +49,13 @@ def apply(db: Session, username: str, body: ConnectorApply) -> Connector:
         created_by=username,
     )
     db.add(c)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConnectorError(
+            f"domain_id '{body.kuscia_domain_id}' 已被占用，请更换后重试", 409
+        ) from exc
     db.refresh(c)
     return c
 
