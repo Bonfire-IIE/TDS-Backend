@@ -1,12 +1,10 @@
 from datetime import datetime, timezone
-from types import SimpleNamespace
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.core.db import Base
 from app.models.audit import AuditEvent
-from app.models.project import Project
+from app.models.privacy_compute import PrivacyComputeProject
 from app.routers.audit import list_events
 
 
@@ -26,9 +24,11 @@ def test_project_lookup_returns_complete_contract_chain():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        db.add(Project(
+        db.add(PrivacyComputeProject(
             id="project-1", name="p", contract_id="contract-1",
-            initiator_connector_id="connector-1", status="draft", created_by="alice",
+            contract_version=1, contract_document_hash="c" * 64,
+            application_code="APP-PSI-BREACH-CHECK", configuration={},
+            status="draft", created_by="alice",
         ))
         add_event(db, "event-1", "contract.filed", "contract:contract-1", 1, contract_id="contract-1")
         add_event(db, "event-2", "usage.decision.denied", "contract:contract-1", 2, contract_id="contract-1")

@@ -5,7 +5,8 @@ from sqlalchemy import select
 from app.core.db import get_db
 from app.core.security import get_current_user
 from app.models.audit import AuditEvent
-from app.models.project import Project
+from app.models import Project
+from app.models.privacy_compute import PrivacyComputeProject
 from app.services.audit import evidence
 
 router = APIRouter(prefix="/audit", tags=["audit"])
@@ -25,7 +26,7 @@ def list_events(
     normalized_contract = (contract_id or "").strip()
     normalized_project = (project_id or "").strip()
     if normalized_project:
-        project = db.get(Project, normalized_project)
+        project = db.get(Project, normalized_project) or db.get(PrivacyComputeProject, normalized_project)
         if not project:
             return {"code": 0, "message": "ok", "data": []}
         if normalized_contract and normalized_contract != project.contract_id:

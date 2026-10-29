@@ -1,4 +1,27 @@
 **/__pycache__
-.pytest_cache
-secrets
-venv
+.pytest_cache/
+*.py[cod]
+
+# Local environments and credentials
+venv/
+.venv/
+secrets/
+.env.*
+!.env.example
+
+# Local runtime data and generated reports
+.data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+htmlcov/
+coverage.xml
+.coverage
+
+# Tool and editor metadata
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store

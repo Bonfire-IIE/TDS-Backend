@@ -1,4 +1,5 @@
 """应用配置（12-factor：环境变量优先，.env 兜底）。"""
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,25 +36,15 @@ class Settings(BaseSettings):
     platform_registry: str = ""
     platform_registry_project: str = ""
 
-    # Kuscia Master 地址与凭据引用由运营方在引导页配置并存入数据库；环境变量
-    # 只定义后端保存上传凭据的根目录。
-    kuscia_credential_root: str = ""
-    # 数据源(DomainDataSource)含加密 info，master 无权操作，须经各连接器(domain)自身的
-    # Lite KusciaAPI 下发。dev 环境两个 Lite 的 KusciaAPI 经宿主机端口(-k)暴露，
-    # 证书/令牌置于 <lite_cert_base>/<domain_id>/ 下（copy 自各 Lite 容器 /home/kuscia/var/certs）。
-    kuscia_lite_cert_base: str = ""
-    kuscia_lite_endpoints: dict[str, str] = {}
-    # Lite 连接器容器名前缀（host 网络下作业路由 endpoint.host 用；用户名前缀取自部署环境）
-    kuscia_lite_ctr_prefix: str = ""
-    kuscia_master_ctr_name: str = ""
-
-    # Kuscia Master 组件日志（kuscia.log / kusciaapi.log / k3s.log / envoy/*.log 等）
-    # 经 master 自身的 KusciaAPI /api/v1/log/node/* 读取，该接口只读本节点，
-    # 因此平台侧看不到连接器的日志（连接器日志由连接器门户查看）。
-    # 单次拉取行数上限：kuscia.log/k3s.log 可达数百 MB，必须始终按 tail 取尾部。
-    kuscia_log_max_lines: int = 5000
-    # 连接器部署指引所需（dev 占位，可用环境变量覆盖）
-    kuscia_image: str = ""
+    # 连接器身份 CA。生产环境应挂载受控目录；开发环境按需生成本地 CA。
+    connector_ca_dir: str = ".data/connector-ca"
+    # 数字合约用户签名私钥。生产环境必须指向持久化、受限访问的目录。
+    signing_key_root: str = ".data/signing-keys"
+    connector_certificate_days: int = 365
+    connector_portal_image: str = "ghcr.io/bonfire-iie/bonfire-connector-portal:2.0.0"
+    connector_seatunnel_image: str = "ghcr.io/bonfire-iie/seatunnel:2.3.8-s3-runtime"
+    connector_kuscia_image: str = "ghcr.io/hangzhuanplus/bonfire-kuscia-bundle:1.2.0b0-fs0.1.0"
+    connector_platform_api_public_url: str = "http://127.0.0.1:8000/api/v1"
     # TDS 标识码生成用：主体标识码(18位)与区域/行业代码(4位)。org 正式模型建好前用平台占位。
     tds_default_subject_code: str = "91110000000000000X"
     tds_default_region_industry: str = "1101"
@@ -73,6 +64,23 @@ class Settings(BaseSettings):
 
     # CORS（前端 Vite 默认端口）
     cors_origins: list[str] = []
+    # Internal execution channel; disabled until an explicit secret is provisioned.
+    execution_auth_mode: str = Field(default="signature", validation_alias=AliasChoices("BONFIRE_EXECUTION_AUTH_MODE", "EXECUTION_AUTH_MODE"))
+    execution_dispatch_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "EXECUTION_DISPATCH_SECRET",
+            "BONFIRE_EXECUTION_DISPATCH_SECRET",
+        ),
+    )
+    # Dispatch runs after the API response; allow extraction and engine setup
+    # to complete without tying the timeout to the browser request lifetime.
+    pets_scheduler_mode: str = "master-lite"
+    kuscia_master_endpoint: str = ""
+    kuscia_master_cert_dir: str = ""
+    kuscia_master_deploy_endpoint: str = ""
+    execution_dispatch_timeout_seconds: float = 600
+    execution_status_poll_seconds: float = 2
 
 
 settings = Settings()

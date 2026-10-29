@@ -9,9 +9,6 @@ class ProjectCreate(BaseModel):
 class WorkflowSubmit(BaseModel):
     workflow: dict
 
-class RunCreate(BaseModel):
-    idempotency_key: str = Field(..., min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
-
 class ApprovalRequest(BaseModel):
     # 可空：省略时由后端按当前用户自动推导其所属的参与方连接器
     connector_id: str | None = None
@@ -25,14 +22,21 @@ class ProjectOut(BaseModel):
     model_config={"from_attributes":True}
 
 class DomainOut(BaseModel):
+    contract_role: str | None = None
     connector_id: str
     domain_id: str
+    connector_name: str
+    org_name: str | None = None
 
 class AvailableDomainDataOut(BaseModel):
+    input_source_type: str | None = None
+    input_format: str | None = None
+    selection_scope: str | None = None
     resource_id: str
     domaindata_id: str
     domain_id: str
     connector_id: str
+    connector_name: str
     name: str
     data_type: str
     datasource_type: str | None = None
@@ -52,5 +56,4 @@ class ApprovalOut(BaseModel):
 class RunOut(BaseModel):
     id: str; kuscia_job_id: str; status: str; job_snapshot: dict; failure_info: dict | None
     created_by: str; created_at: datetime; updated_at: datetime
-    idempotency_key: str | None = None
     model_config={"from_attributes":True}

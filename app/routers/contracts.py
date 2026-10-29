@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
+import yaml
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -62,6 +64,15 @@ def get_contract(
     except svc.ContractError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     return _wrap(_out(c))
+
+@router.get("/{contract_id}/document")
+def export_document(contract_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        c = svc.get(db, contract_id, user["username"], _is_operator(user))
+    except svc.ContractError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    payload = yaml.safe_dump(c.document, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    return Response(content=payload, media_type="application/yaml", headers={"Content-Disposition": f'attachment; filename="{contract_id}.yaml"'})
 
 
 def _action(fn, contract_id, user, db, *args):

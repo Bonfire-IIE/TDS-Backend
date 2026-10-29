@@ -13,7 +13,6 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.integrations.kuscia import KusciaError, get_kuscia_client
 from app.models.appimage import AppImage
 from app.schemas.appimage import AppImageCreate
 
@@ -29,6 +28,45 @@ class AppImageError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+def _party_role_names(party_schema: dict | None) -> set[str]:
+    raw_roles = (party_schema or {}).get("roles") or []
+    roles = {
+        role if isinstance(role, str) else role.get("name")
+        for role in raw_roles
+        if isinstance(role, str) or isinstance(role, dict)
+    }
+    if None in roles or "" in roles or len(roles) != len(raw_roles):
+        raise AppImageError("party_schema.roles 必须包含唯一且非空的角色名称", 400)
+    return roles
+
+
+def _validate_role_contract(body: AppImageCreate) -> None:
+    roles = _party_role_names(body.party_schema)
+    for role in (body.party_schema or {}).get('roles',[]):
+        if not isinstance(role,dict) or not isinstance(role.get('title'),str) or not role['title'].strip():
+            raise AppImageError('新增或修改角色定义时须填写可读名称',400)
+    for direction in ('inputs','outputs'):
+        for port in (body.io_schema or {}).get(direction,[]):
+            if not isinstance(port,dict) or not isinstance(port.get('title'),str) or not port['title'].strip():
+                raise AppImageError('新增或修改端口定义时须填写可读名称',400)
+    deploy_roles = {
+        template.get("role")
+        for template in body.deploy_templates
+        if isinstance(template, dict) and template.get("role")
+    }
+    undeclared_deploy_roles = deploy_roles - roles
+    if undeclared_deploy_roles:
+        raise AppImageError(
+            "部署模板引用了未声明的参与方角色: " + ", ".join(sorted(undeclared_deploy_roles)),
+            400,
+        )
+    for direction in ("inputs", "outputs"):
+        for port in ((body.io_schema or {}).get(direction) or []):
+            role = port.get("role") if isinstance(port, dict) else None
+            if role and role not in roles:
+                raise AppImageError(f"I/O 端口 {port.get('name')} 引用了未声明的参与方角色: {role}", 400)
 
 
 def normalize_kuscia_fields(value):
@@ -94,47 +132,21 @@ def seed_builtin(db: Session) -> None:
     仅读取 Kuscia 已有结构（query_appimage），不重复创建 Kuscia 侧。
     读取失败静默跳过（Kuscia 不可用时不阻断列表）。
     """
-    if db.execute(select(AppImage).limit(1)).first():
-        return
-    client = get_kuscia_client()
-    added = False
-    for name, capability in BUILTIN_APPIMAGES.items():
-        try:
-            data = client.query_appimage(name)
-        except KusciaError:
-            continue
-        if not data:
-            continue
-        image = data.get("image", {}) or {}
-        row = AppImage(
-            name=data.get("name", name),
-            display_name=data.get("name", name),
-            description="Kuscia 内置应用能力",
-            capability=capability,
-            image_name=image.get("name", ""),
-            image_tag=image.get("tag", ""),
-            deploy_templates=data.get("deploy_templates"),
-            config_templates=data.get("config_templates"),
-            status="registered",
-            scope="builtin",
-            created_by="system",
-        )
-        db.add(row)
-        added = True
-    if added:
-        db.commit()
+    # Built-ins are registered explicitly by the platform operator.  The
+    # center never discovers or queries an execution engine for capabilities.
+    return
 
 
 # ---- 注册自定义应用能力 ----
 def register(db: Session, username: str, is_operator: bool, body: AppImageCreate) -> AppImage:
     if not body.deploy_templates:
         raise AppImageError("deploy_templates 不能为空", 400)
+    _validate_role_contract(body)
     ports={direction:{p.get("name") for p in ((body.io_schema or {}).get(direction) or []) if isinstance(p,dict)} for direction in ("inputs","outputs")}
     if any(None in names or len(names)!=len((body.io_schema or {}).get(direction) or []) for direction,names in ports.items()):
         raise AppImageError("I/O 端口必须有唯一的 name",400)
-    # task_input_template 是平台工作流的可选适配层，不是 AppImage 的必需字段。
-    # 应用开发商可以在自身镜像/配置中定义输入入口；没有平台模板时，项目运行阶段
-    # 继续使用节点提供的 task_input_config（见 services/project.py）。
+    if ports["inputs"] and body.task_input_template is None:
+        raise AppImageError("声明输入端口的应用必须提供 task_input_template",400)
     def scan(value):
         if isinstance(value,dict):
             for child in value.values(): scan(child)
@@ -173,22 +185,8 @@ def register(db: Session, username: str, is_operator: bool, body: AppImageCreate
     else:
         image_name = body.image_name.strip()
         registry = body.registry or (image_name.split("/", 1)[0] if "/" in image_name else "docker.io")
-    try:
-        get_kuscia_client().create_appimage(
-            name=kuscia_name,
-            image_name=image_name,
-            image_tag=body.image_tag,
-            deploy_templates=deploy_templates,
-            config_templates=config_templates,
-        )
-    except KusciaError as e:
-        # YAML 可能已先通过 kubectl/KusciaAPI 创建；校验镜像一致后纳管。
-        if "exist" not in str(e).lower():
-            raise AppImageError(f"创建 Kuscia AppImage 失败: {e}", 502) from e
-        remote = get_kuscia_client().query_appimage(kuscia_name)
-        remote_image = remote.get("image", {}) or {}
-        if remote_image.get("name") != image_name or remote_image.get("tag") != body.image_tag:
-            raise AppImageError(f"Kuscia 中已存在同名 AppImage {kuscia_name}，但镜像不一致", 409)
+    # The definition is a platform template.  Registration in a concrete
+    # engine is performed by the connector-side adapter when a run is sent.
 
     row = AppImage(
         name=kuscia_name,
@@ -220,11 +218,11 @@ def register(db: Session, username: str, is_operator: bool, body: AppImageCreate
 
 
 # ---- 检索 ----
-def list_appimages(db: Session, username: str, is_admin: bool) -> list[AppImage]:
+def list_appimages(db: Session, username: str, is_operator: bool) -> list[AppImage]:
     seed_builtin(db)
     stmt = select(AppImage).order_by(AppImage.created_at.desc())
     # 可见性：已登记对所有人可见；下架的仅属主/运营方可见
-    if not is_admin:
+    if not is_operator:
         stmt = stmt.where(
             or_(AppImage.status == "registered", AppImage.created_by == username)
         )
@@ -238,12 +236,12 @@ def get(db: Session, appimage_id: str) -> AppImage:
     return row
 
 
-def delist(db: Session, appimage_id: str, username: str, is_admin: bool) -> AppImage:
+def delist(db: Session, appimage_id: str, username: str, is_operator: bool) -> AppImage:
     row = get(db, appimage_id)
     # 内置能力受保护，不可下架
     if row.scope == "builtin":
         raise AppImageError("内置应用能力受保护，不可下架", 403)
-    if not is_admin and row.created_by != username:
+    if not is_operator and row.created_by != username:
         raise AppImageError("无权操作", 403)
     row.status = "delisted"
     db.commit()
@@ -261,6 +259,7 @@ def update(db: Session, appimage_id: str, username: str, is_operator: bool, body
         raise AppImageError("AppImage 标识不可修改", 400)
     if not body.deploy_templates:
         raise AppImageError("deploy_templates 不能为空", 400)
+    _validate_role_contract(body)
     deploy_templates = normalize_kuscia_fields(body.deploy_templates)
     config_templates = body.config_templates or None
     if body.registry_source == "platform":
@@ -271,10 +270,7 @@ def update(db: Session, appimage_id: str, username: str, is_operator: bool, body
         registry = settings.platform_registry
     else:
         image_name, registry = body.image_name.strip(), body.registry or (body.image_name.split("/", 1)[0] if "/" in body.image_name else "docker.io")
-    try:
-        get_kuscia_client().update_appimage(row.name, image_name, body.image_tag, deploy_templates, config_templates)
-    except KusciaError as e:
-        raise AppImageError(f"更新 Kuscia AppImage 失败: {e}", 502) from e
+    # Updating the platform template does not mutate any downstream engine.
     for field in ("display_name", "description", "capability", "operations", "uc_capabilities", "registry_source", "registry", "image_tag", "job_template", "io_schema", "party_schema", "parameter_schema", "ui_schema", "task_input_template"):
         setattr(row, field, getattr(body, field))
     row.image_name, row.deploy_templates, row.config_templates = image_name, deploy_templates, config_templates

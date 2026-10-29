@@ -5,11 +5,25 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.integrations.keycloak import AuthError, decode_token, extract_user
 
 bearer = HTTPBearer(auto_error=True)
+optional_bearer = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
     cred: HTTPAuthorizationCredentials = Depends(bearer),
 ) -> dict:
+    try:
+        claims = decode_token(cred.credentials)
+    except AuthError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    return extract_user(claims)
+
+
+def get_optional_current_user(
+    cred: HTTPAuthorizationCredentials | None = Depends(optional_bearer),
+) -> dict | None:
+    """Resolve a user when present while allowing authenticated service calls."""
+    if cred is None:
+        return None
     try:
         claims = decode_token(cred.credentials)
     except AuthError as e:

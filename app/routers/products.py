@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.security import get_current_user
 from app.models.product import DataProduct
-from app.schemas.product import ProductCreate, ProductOut
+from app.schemas.product import ProductCreate, ProductOut, ProductPublish
 from app.services import product as svc
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -58,6 +58,8 @@ def get_product(
 ) -> dict:
     try:
         r = svc.get(db, product_id)
+        if r.status != "listed" and r.created_by != user["username"] and not _is_admin(user):
+            raise svc.ProductError("产品不存在或不可访问", 404)
     except svc.ProductError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     return _wrap(_out(r))
@@ -76,6 +78,20 @@ def delist_product(
     return _wrap(_out(r))
 
 
+@router.put("/{product_id}")
+def update_product(
+    product_id: str,
+    body: ProductCreate,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        r = svc.update(db, product_id, user["username"], _is_admin(user), body)
+    except svc.ProductError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    return _wrap(_out(r))
+
+
 @router.delete("/{product_id}")
 def delete_product(
     product_id: str,
@@ -87,3 +103,12 @@ def delete_product(
     except svc.ProductError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
     return _wrap({"deleted": product_id})
+
+
+@router.post("/{product_id}/publish")
+def publish_product(product_id: str, body: ProductPublish, user: dict = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    try:
+        row = svc.publish(db, product_id, user["username"], _is_operator(user), body)
+    except svc.ProductError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    return _wrap(_out(row))

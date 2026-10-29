@@ -1,19 +1,19 @@
-"""连接器业务逻辑：申请/审批/驳回/导入 + 部署指引 + 实时状态派生。"""
+"""连接器软件分发、CSR 注册、审批和机器身份激活。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import re
+
+from cryptography.hazmat.primitives import serialization
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.identifier import gen_connector_code
-from app.integrations.kuscia import (
-    KusciaError,
-    get_kuscia_client,
-    get_kuscia_master_deploy_endpoint,
-)
 from app.models.connector import Connector
 from app.schemas.connector import ConnectorApply, ConnectorImport
+from app.services.connector_identity import IdentityError, certificate_fingerprint, issue_certificate, parse_csr
 
 
 class ConnectorError(Exception):
@@ -24,28 +24,46 @@ class ConnectorError(Exception):
 
 
 def _exists(db: Session, **kw) -> bool:
-    # 仅在未软删除行中查重（软删后同名 domain/标识码应可再次登记）
-    stmt = select(Connector).filter_by(**kw).where(Connector.deleted_at.is_(None))
-    return db.execute(stmt).first() is not None
+    return db.execute(select(Connector).filter_by(**kw).where(Connector.deleted_at.is_(None))).first() is not None
+
+
+def _csr(body: ConnectorApply):
+    try:
+        return parse_csr(body.csr_pem)
+    except IdentityError as exc:
+        raise ConnectorError(str(exc), 422) from exc
 
 
 def apply(db: Session, username: str, body: ConnectorApply) -> Connector:
-    # 数据库唯一约束覆盖软删除行，不能只检查当前有效记录，否则历史软删除行会在
-    # commit 时触发未处理的 UniqueViolation，并把 SQL/堆栈暴露给调用端。
-    existing = db.scalar(select(Connector).where(
-        Connector.kuscia_domain_id == body.kuscia_domain_id
-    ))
+    csr, csr_fp, key_fp = _csr(body)
+    existing = db.scalar(select(Connector).where(Connector.public_key_fingerprint == key_fp))
+    if existing and existing.deleted_at is None:
+        raise ConnectorError("该连接器公钥已提交注册", 409)
     if existing:
-        raise ConnectorError(f"domain_id '{body.kuscia_domain_id}' 已被占用", 409)
+        existing.name = body.name
+        existing.org_name = body.org_name
+        existing.csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("ascii")
+        existing.csr_fingerprint = csr_fp
+        existing.status = "applying"
+        existing.tds_code = None
+        existing.certificate_pem = None
+        existing.certificate_serial = None
+        existing.certificate_not_before = None
+        existing.certificate_not_after = None
+        existing.activated_at = None
+        existing.last_seen_at = None
+        existing.created_by = username
+        existing.deleted_at = None
+        db.commit()
+        db.refresh(existing)
+        return existing
     c = Connector(
         name=body.name,
         org_name=body.org_name,
-        kuscia_domain_id=body.kuscia_domain_id,
+        csr_pem=body.csr_pem,
+        csr_fingerprint=csr_fp,
+        public_key_fingerprint=key_fp,
         status="applying",
-        lite_api_endpoint=body.lite_api_endpoint,
-        lite_api_port=body.lite_api_port,
-        auth_port=body.auth_port, grpc_port=body.grpc_port,
-        app_port=body.app_port, data_port=body.data_port,
         created_by=username,
     )
     db.add(c)
@@ -53,9 +71,7 @@ def apply(db: Session, username: str, body: ConnectorApply) -> Connector:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise ConnectorError(
-            f"domain_id '{body.kuscia_domain_id}' 已被占用，请更换后重试", 409
-        ) from exc
+        raise ConnectorError("该 CSR 或公钥已提交注册", 409) from exc
     db.refresh(c)
     return c
 
@@ -68,16 +84,23 @@ def _assign_tds_code(db: Session) -> str:
     raise ConnectorError("标识码分配失败，请重试", 500)
 
 
+def _cert_time(cert, name: str):
+    aware = getattr(cert, f"{name}_utc", None)
+    value = aware if aware is not None else getattr(cert, name)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 def approve(db: Session, connector_id: str) -> Connector:
     c = _get_or_404(db, connector_id)
     if c.status != "applying":
         raise ConnectorError(f"当前状态 {c.status} 不可审批", 409)
-    # 建 Kuscia Domain（真集成），分配 32 位标识码
-    try:
-        get_kuscia_client().create_domain(c.kuscia_domain_id)
-    except KusciaError as e:
-        raise ConnectorError(f"创建 Kuscia Domain 失败: {e}", 502) from e
+    csr, _, _ = parse_csr(c.csr_pem)
     c.tds_code = _assign_tds_code(db)
+    cert, pem, _, _ = issue_certificate(csr, c.id, c.tds_code, c.org_name)
+    c.certificate_pem = pem
+    c.certificate_serial = format(cert.serial_number, "x")
+    c.certificate_not_before = _cert_time(cert, "not_valid_before")
+    c.certificate_not_after = _cert_time(cert, "not_valid_after")
     c.status = "approved"
     db.commit()
     db.refresh(c)
@@ -95,31 +118,8 @@ def reject(db: Session, connector_id: str) -> Connector:
 
 
 def import_existing(db: Session, username: str, body: ConnectorImport) -> Connector:
-    """把已存在的 Kuscia Domain（如 alice/bob）登记为已批准连接器。"""
-    if _exists(db, kuscia_domain_id=body.kuscia_domain_id):
-        raise ConnectorError(f"domain '{body.kuscia_domain_id}' 已登记", 409)
-    try:
-        data = get_kuscia_client().query_domain(body.kuscia_domain_id).get("data", {})
-        if not data.get("domain_id"):
-            raise ConnectorError(f"Kuscia 中不存在 domain '{body.kuscia_domain_id}'", 404)
-    except KusciaError as e:
-        raise ConnectorError(f"查询 Kuscia Domain 失败: {e}", 502) from e
-    c = Connector(
-        name=body.name or body.kuscia_domain_id,
-        org_name=body.org_name,
-        kuscia_domain_id=body.kuscia_domain_id,
-        tds_code=_assign_tds_code(db),
-        status="approved",
-        lite_api_endpoint=body.lite_api_endpoint,
-        lite_api_port=body.lite_api_port,
-        auth_port=body.auth_port, grpc_port=body.grpc_port,
-        app_port=body.app_port, data_port=body.data_port,
-        created_by=username,
-    )
-    db.add(c)
-    db.commit()
-    db.refresh(c)
-    return c
+    c = apply(db, username, body)
+    return approve(db, c.id)
 
 
 def _get_or_404(db: Session, connector_id: str) -> Connector:
@@ -133,16 +133,24 @@ def get(db: Session, connector_id: str) -> Connector:
     return _get_or_404(db, connector_id)
 
 
-def report_node_info(db: Session, connector_id: str, username: str, is_admin: bool, body) -> Connector:
-    """连接器门户部署完 Lite 后回传节点物理信息；仅更新提供的字段。属主或 admin 可报。"""
+def certificate(db: Session, connector_id: str) -> tuple[Connector, str]:
     c = _get_or_404(db, connector_id)
-    if c.created_by != username and not is_admin:
-        raise ConnectorError("无权回传该连接器节点信息", 403)
-    for field in ("endpoint", "lite_api_endpoint", "lite_api_port",
-                  "auth_port", "grpc_port", "app_port", "data_port"):
-        val = getattr(body, field, None)
-        if val is not None:
-            setattr(c, field, val)
+    if c.status not in {"approved", "active"} or not c.certificate_pem:
+        raise ConnectorError("连接器尚未审批签发证书", 409)
+    from app.services.connector_identity import ca_certificate_pem
+    return c, ca_certificate_pem()
+
+
+def activate(db: Session, connector_id: str, fingerprint: str) -> Connector:
+    c = _get_or_404(db, connector_id)
+    if not c.certificate_pem:
+        raise ConnectorError("连接器尚未签发证书", 409)
+    if certificate_fingerprint(c.certificate_pem) != fingerprint.lower():
+        raise ConnectorError("本地证书与中心签发证书不一致", 403)
+    now = datetime.now(timezone.utc)
+    c.status = "active"
+    c.activated_at = c.activated_at or now
+    c.last_seen_at = now
     db.commit()
     db.refresh(c)
     return c
@@ -152,60 +160,123 @@ def list_for(db: Session, username: str, is_admin: bool) -> list[Connector]:
     stmt = select(Connector).where(Connector.deleted_at.is_(None))
     if not is_admin:
         stmt = stmt.where(Connector.created_by == username)
-    stmt = stmt.order_by(Connector.created_at.desc())
-    return list(db.execute(stmt).scalars())
+    return list(db.scalars(stmt.order_by(Connector.created_at.desc())))
 
 
 def soft_delete(db: Session, connector_id: str) -> None:
     c = _get_or_404(db, connector_id)
+    c.status = "revoked"
     c.deleted_at = func.now()
     db.commit()
 
 
-def display_status(c: Connector) -> str:
-    """派生展示态：approved 连接器按 Kuscia 实时在线情况显示 online/offline。"""
-    if c.status != "approved":
-        return c.status
-    try:
-        return "online" if get_kuscia_client().domain_online(c.kuscia_domain_id) else "offline"
-    except KusciaError:
-        return "offline"
-
-
-def _deploy_commands(c: Connector, token: str | None) -> str:
-    img = settings.kuscia_image
-    master = get_kuscia_master_deploy_endpoint()
-    tok = token or "<部署令牌不可用：请确认该连接器已审批且令牌未被使用>"
-    domain_id = c.kuscia_domain_id
-    auth, api = c.auth_port or 1080, c.lite_api_port or 8082
-    grpc, app, data = c.grpc_port or 8083, c.app_port or 80, c.data_port or 9091
-    return f"""# 在【连接器主机】上执行（需能访问 master {master}）
-export KUSCIA_IMAGE={img}
-docker pull $KUSCIA_IMAGE
-docker run --rm $KUSCIA_IMAGE cat /home/kuscia/scripts/deploy/kuscia.sh > kuscia.sh && chmod +x kuscia.sh
-docker run -it --rm $KUSCIA_IMAGE kuscia init --mode lite --domain {domain_id} \\
-  --master-endpoint "{master}" --lite-deploy-token "{tok}" > lite_{domain_id}.yaml
-# 同机多节点需错开端口(-p 认证 -k KusciaAPI-HTTP -g GRPC -q 应用 -x metrics)
-./kuscia.sh start -c lite_{domain_id}.yaml -p {auth} -k {api} -g {grpc} -q {app} -x {data}"""
-
-
-def deploy_info(c: Connector) -> dict:
-    if c.status != "approved":
-        raise ConnectorError("连接器未审批，无部署信息", 409)
-    token = None
-    try:
-        token = get_kuscia_client().get_deploy_token(c.kuscia_domain_id)
-    except KusciaError:
-        pass
+def deployment_instructions(system: str, deployment_platform: str, architecture: str, version: str) -> dict:
+    if system != "linux" or architecture != "amd64":
+        raise ConnectorError("当前已验证的连接器发布包仅支持 Linux amd64", 422)
+    if deployment_platform != "docker-compose":
+        raise ConnectorError("当前已验证的部署方式仅支持 Docker Compose", 422)
+    image = settings.connector_portal_image
+    api = settings.connector_platform_api_public_url
+    if deployment_platform == "docker-compose":
+        base_url = api.rstrip('/')
+        commands = f"""mkdir -p bonfire-connector
+cd bonfire-connector
+curl -fsSLo docker-compose.yml {base_url}/connectors/downloads/{version}/docker-compose.yml
+curl -fsSLo connector-runtime.tar.gz {base_url}/connectors/downloads/{version}/connector-runtime.tar.gz
+mkdir -p runtime && tar -xzf connector-runtime.tar.gz -C runtime
+CONNECTOR_ID=connector-$(hostname | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-30)
+cat > .env <<EOF
+COMPOSE_PROJECT_NAME=$CONNECTOR_ID
+CONNECTOR_ID=$CONNECTOR_ID
+CONNECTOR_IMAGE={image}
+SEATUNNEL_IMAGE={settings.connector_seatunnel_image}
+PLATFORM_API_BASE={api}
+PORTAL_PORT=8100
+BONFIRE_EXECUTION_DISPATCH_SECRET=
+EOF
+chmod 600 .env
+docker compose pull
+docker compose up -d --wait --wait-timeout 180
+curl --noproxy '*' -fsS http://127.0.0.1:8100/health
+docker compose ps"""
     return {
-        "kuscia_domain_id": c.kuscia_domain_id,
-        "deploy_token": token,
-        "master_endpoint": get_kuscia_master_deploy_endpoint(),
-        "kuscia_image": settings.kuscia_image,
-        "commands": _deploy_commands(c, token),
+        "system": system,
+        "deployment_platform": deployment_platform,
+        "architecture": architecture,
+        "version": version,
+        "commands": commands,
+        "notes": ["执行通道默认关闭；由部署管理员通过受控渠道将至少 32 字符的随机执行密钥分别配置到中心和受信 Portal 的 .env，下载接口不返回该密钥。", "部署内容包含 Connector Portal 与该连接器独立的 SeaTunnel 实例。", "配置保存在部署目录的 .env 文件中；请限制该文件的读取权限。", "首次启动后在 Portal 本地生成私钥和 CSR。", "Kuscia 等隐私计算引擎需要在连接器注册完成后单独集成。"],
     }
 
 
-def deploy_script(c: Connector) -> str:
-    info = deploy_info(c)
-    return "#!/bin/bash\nset -euo pipefail\n" + info["commands"] + "\n"
+def connector_compose(version: str) -> str:
+    """Render a self-contained Docker Compose bundle for one v2 connector.
+
+    Environment variables are deliberately used for all deployment-specific
+    values so the downloaded file can be reused for multiple connectors.
+    Kuscia is not part of this base bundle; it is installed later by the
+    connector's privacy-compute integration flow.
+    """
+    if not version or not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        raise ConnectorError("连接器版本标识无效", 422)
+    return f'''services:
+  portal:
+    image: ${{CONNECTOR_IMAGE:-{settings.connector_portal_image}}}
+    container_name: bonfire-${{CONNECTOR_ID:-connector}}-portal
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "${{PORTAL_PORT:-8100}}:8100"
+    environment:
+      PORT: "8100"
+      PLATFORM_API_BASE: ${{PLATFORM_API_BASE:?set PLATFORM_API_BASE}}
+      PORTAL_DATA_DIR: /state
+      PORTAL_HOME: /state
+      STORAGE_ROOT: /data
+      WEB_DIST: /app/web/dist
+      BONFIRE_EXECUTION_DISPATCH_SECRET: ${{BONFIRE_EXECUTION_DISPATCH_SECRET:-}}
+      PORTAL_CONTAINER_HOST: host.docker.internal
+      SEATUNNEL_API_BASE: http://seatunnel:5801
+      SEATUNNEL_SOURCE_ROOT: /connectors/source
+      SEATUNNEL_STAGING_ROOT: /var/lib/bonfire/staging
+      KUSCIA_STAGING_RELATIVE_ROOT: staging
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - connector-state:/state
+      - connector-data:/data
+      - connector-staging:/var/lib/bonfire/staging
+    depends_on:
+      seatunnel:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  seatunnel:
+    image: ${{SEATUNNEL_IMAGE:-{settings.connector_seatunnel_image}}}
+    container_name: bonfire-${{CONNECTOR_ID:-connector}}-seatunnel
+    restart: unless-stopped
+    command: ["/opt/seatunnel/bin/seatunnel-cluster.sh"]
+    expose:
+      - "5801"
+    volumes:
+      - seatunnel-logs:/opt/seatunnel/logs
+      - connector-data:/connectors/source:ro
+      - connector-staging:/var/lib/bonfire/staging
+      - ./runtime/seatunnel/guava-27-bonfire.jar:/opt/seatunnel/lib/guava-27-bonfire.jar:ro
+      - ./runtime/seatunnel/hive-exec-3.1.3.jar:/opt/seatunnel/lib/hive-exec-3.1.3.jar:ro
+
+volumes:
+  connector-state:
+    name: bonfire-${{CONNECTOR_ID:-connector}}-state
+  connector-data:
+    name: bonfire-${{CONNECTOR_ID:-connector}}-data
+  connector-staging:
+    name: bonfire-${{CONNECTOR_ID:-connector}}-staging
+  seatunnel-logs:
+    name: bonfire-${{CONNECTOR_ID:-connector}}-seatunnel-logs
+'''

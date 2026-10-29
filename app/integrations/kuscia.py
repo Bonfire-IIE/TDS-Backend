@@ -18,23 +18,7 @@ from app.core.config import settings
 
 
 class KusciaError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "KUSCIA_ERROR", diagnostic: str | None = None):
-        super().__init__(message)
-        self.code = code
-        self.diagnostic = diagnostic
-
-
-def _kuscia_request_error(exc: httpx.HTTPError) -> KusciaError:
-    if isinstance(exc, httpx.TimeoutException):
-        return KusciaError("Kuscia Master 响应超时，请检查节点状态和网络", code="KUSCIA_TIMEOUT", diagnostic=repr(exc))
-    if isinstance(exc, httpx.ConnectError):
-        return KusciaError("无法连接 Kuscia Master，请检查地址、端口和网络", code="KUSCIA_UNREACHABLE", diagnostic=repr(exc))
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        if status in (401, 403):
-            return KusciaError("Kuscia Master 拒绝认证，请检查证书和令牌", code="KUSCIA_AUTH_FAILED", diagnostic=repr(exc))
-        return KusciaError(f"Kuscia Master 返回异常状态（HTTP {status}）", code="KUSCIA_UPSTREAM_ERROR", diagnostic=repr(exc))
-    return KusciaError("Kuscia Master 请求失败", diagnostic=repr(exc))
+    pass
 
 
 class ChunkedJsonParser:
@@ -65,9 +49,8 @@ class ChunkedJsonParser:
 
 
 class KusciaClient:
-    def __init__(self, endpoint: str, cert_dir: str, domain_id: str | None = None) -> None:
+    def __init__(self, endpoint: str, cert_dir: str) -> None:
         self.endpoint = endpoint.rstrip("/")
-        self.domain_id = domain_id
         crt = os.path.join(cert_dir, "kusciaapi-server.crt")
         key = os.path.join(cert_dir, "kusciaapi-server.key")
         ca = os.path.join(cert_dir, "ca.crt")
@@ -96,11 +79,8 @@ class KusciaClient:
             resp = self._client.post(path, json=payload)
             resp.raise_for_status()
         except httpx.HTTPError as e:  # 网络/TLS/HTTP 错误
-            raise _kuscia_request_error(e) from e
-        try:
-            data = resp.json()
-        except ValueError as e:
-            raise KusciaError("Kuscia Master 返回了无法解析的响应", code="KUSCIA_INVALID_RESPONSE", diagnostic=repr(e)) from e
+            raise KusciaError(str(e)) from e
+        data = resp.json()
         status = data.get("status", {})
         if status.get("code") not in (0, None):
             raise KusciaError(status.get("message", "kuscia api error"))
@@ -228,7 +208,7 @@ class KusciaClient:
 
     # ---- ClusterDomainRoute（连接器间通信路由）----
     def create_cluster_route(
-        self, src: str, dst: str, dst_host: str, port: int = 1080,
+        self, src: str, dst: str, dst_host: str, port: int = 1080, tls: bool = False,
     ) -> None:
         """建立 src -> dst 的单向 ClusterDomainRoute（Token/RSA-GEN，明文 HTTP）。
 
@@ -244,7 +224,7 @@ class KusciaClient:
                     "host": dst_host,
                     "ports": [{
                         "name": "http", "port": port,
-                        "protocol": "HTTP", "isTLS": False,
+                        "protocol": "HTTP", "isTLS": tls,
                     }],
                 },
                 "token_config": {"token_gen_method": "RSA-GEN"},
@@ -328,6 +308,12 @@ class KusciaClient:
         data = self._post("/api/v1/job/status/batchQuery", {"job_ids": job_ids})
         return data.get("data", {}).get("jobs", [])
 
+    def cancel_job(self, job_id: str) -> None:
+        self._post("/api/v1/job/cancel", {"job_id": job_id})
+
+    def job_quiescence(self, job_id: str, task_ids: list[str], reference_scope: list[str] | None = None) -> dict:
+        return self._post('/api/v1/job/quiescence',{'job_id':job_id,'task_ids':task_ids,'reference_scope':reference_scope or []}).get('data') or {}
+
     def delete_job(self, job_id: str) -> None:
         self._post("/api/v1/job/delete", {"job_id": job_id})
 
@@ -369,10 +355,8 @@ class KusciaClient:
 
     # ---- 健康探测 ----
     def ping(self) -> bool:
-        """能成功查到当前 Master 自身的 Domain 即视为 KusciaAPI 可用。"""
-        if not self.domain_id:
-            raise KusciaError("未配置 Kuscia Master Domain ID")
-        self.query_domain(self.domain_id)
+        """能成功查到任一已知节点即视为 KusciaAPI 可用。"""
+        self.query_domain("kuscia-system")
         return True
 
     def close(self) -> None:
@@ -380,7 +364,9 @@ class KusciaClient:
 
 
 def get_kuscia_client() -> KusciaClient:
-    """从数据库读取中心平台当前启用的 Master（唯一配置来源）。"""
+    """Use the explicitly configured center Master; no edge scheduler fallback."""
+    if settings.kuscia_master_endpoint and settings.kuscia_master_cert_dir:
+        return KusciaClient(settings.kuscia_master_endpoint, settings.kuscia_master_cert_dir)
     try:
         from sqlalchemy import select
         from app.core.db import SessionLocal
@@ -397,18 +383,16 @@ def get_kuscia_client() -> KusciaClient:
             ).first()
             if master and master.credential_ref.startswith("file:"):
                 endpoint = f"{master.scheme}://{master.deployment_ip}:{master.api_port}"
-                return KusciaClient(
-                    endpoint=endpoint,
-                    cert_dir=master.credential_ref[5:],
-                    domain_id=master.domain_id,
-                )
+                return KusciaClient(endpoint=endpoint, cert_dir=master.credential_ref[5:])
     except Exception as exc:
         raise KusciaError(f"无法读取 Kuscia Master 配置: {exc}") from exc
     raise KusciaError("尚未完成 Kuscia Master 接入，请先完成中心平台初始化向导")
 
 
 def get_kuscia_master_deploy_endpoint() -> str:
-    """返回连接器部署使用的 Master 网关地址（数据库唯一来源）。"""
+    """Return the center Master gateway used to enroll Lite nodes."""
+    if settings.kuscia_master_deploy_endpoint:
+        return settings.kuscia_master_deploy_endpoint.rstrip("/")
     try:
         from sqlalchemy import select
         from app.core.db import SessionLocal
@@ -455,4 +439,4 @@ def get_kuscia_lite_client(domain_id: str, endpoint: str | None = None) -> Kusci
     cert_dir = os.path.join(settings.kuscia_lite_cert_base, domain_id)
     if not os.path.isfile(os.path.join(cert_dir, "token")):
         raise KusciaError(f"缺少连接器 '{domain_id}' 的 Lite KusciaAPI 证书({cert_dir})")
-    return KusciaClient(endpoint=endpoint, cert_dir=cert_dir, domain_id=domain_id)
+    return KusciaClient(endpoint=endpoint, cert_dir=cert_dir)

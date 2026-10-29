@@ -12,6 +12,7 @@ from app.integrations.opa import OPAError, get_opa_client
 from app.models.contract import DigitalContract
 from app.models.usage import UsageCounter, UsageRecord
 from app.services.audit import append as audit_append, contract_stream
+from app.services.standard_contract import info as contract_info, subject as contract_subject, execution_nodes, allowed_app_images, allowed_applications, legacy_policy_input
 
 
 class UsageError(Exception):
@@ -21,6 +22,11 @@ class UsageError(Exception):
         self.status_code = status_code
         self.code = code
         self.diagnostic = diagnostic
+
+
+def _normalize_exec_env(value: object) -> str:
+    """Return the canonical identifier used by contracts, AppImages, and OPA."""
+    return str(value or "").strip().casefold()
 
 
 def _parse_time(value: str | None) -> int | None:
@@ -38,7 +44,8 @@ def _parse_time(value: str | None) -> int | None:
 def compile_contract(contract: DigitalContract) -> dict:
     """把合约业务 JSON 编译为 OPA data；Rego 保持固定，不生成合约专属代码。"""
     policies = []
-    for index, source in enumerate(contract.policies or []):
+    document = contract.document
+    for index, source in enumerate(legacy_policy_input(document)):
         constraints = source.get("constraints") or {}
         window = constraints.get("time_window") or {}
         compiled_constraints: dict = {}
@@ -50,22 +57,25 @@ def compile_contract(contract: DigitalContract) -> dict:
         if constraints.get("count") is not None:
             compiled_constraints["count"] = {"max": int(constraints["count"])}
         if constraints.get("exec_env"):
-            compiled_constraints["exec_env"] = constraints["exec_env"]
+            compiled_constraints["exec_env"] = _normalize_exec_env(constraints["exec_env"])
         policies.append({
             "id": f"{contract.contract_id}:{index + 1}",
-            "effect": source.get("type"),
+            "effect": source.get("effect"),
             "actions": {action: True for action in source.get("actions", [])},
             "constraints": compiled_constraints,
             "obligations": source.get("obligations", []),
         })
+    permitted_applications = list(dict.fromkeys(
+        allowed_applications(document) + allowed_app_images(document)
+    ))
     return {
         "contract_id": contract.contract_id,
-        "status": contract.status,
-        "product_id": contract.product_id,
-        "provider_connector_id": contract.provider_connector_id,
-        "consumer_connector_id": contract.consumer_connector_id,
-        "contract_hash": contract.contract_hash,
-        "allowed_appimages": {name: True for name in (getattr(contract, "allowed_appimages", None) or [])},
+        "status": contract_info(document)["contractStatus"],
+        "product_id": contract_subject(document)["dataProductId"],
+        "provider_connector_id": execution_nodes(document)["providerNodeId"],
+        "consumer_connector_id": execution_nodes(document)["consumerNodeId"],
+        "contract_hash": contract.document_hash,
+        "allowed_applications": {code: True for code in permitted_applications},
         "policies": policies,
     }
 
@@ -78,12 +88,12 @@ def _enforce_obligations(apps: list[dict], obligations: list[str]) -> dict:
         capabilities = set(app.get("uc_capabilities") or [])
         absent = [item for item in required if item not in capabilities]
         if absent:
-            missing[app["app_image"]] = absent
+            missing[app["application_code"]] = absent
         operations = set(app.get("operations") or [])
         if "no_download" in required and "download" in operations:
-            missing.setdefault(app["app_image"], []).append("no_download 与 download 操作冲突")
+            missing.setdefault(app["application_code"], []).append("no_download 与 download 操作冲突")
         if "no_export" in required and "export" in operations:
-            missing.setdefault(app["app_image"], []).append("no_export 与 export 操作冲突")
+            missing.setdefault(app["application_code"], []).append("no_export 与 export 操作冲突")
     if missing:
         detail = "；".join(f"{name}: {', '.join(items)}" for name, items in missing.items())
         raise UsageError(f"应用无法强制执行合约义务：{detail}", 403, "OBLIGATION_UNSUPPORTED")
@@ -109,22 +119,23 @@ def _locked_counter(db: Session, contract_id: str, action: str) -> UsageCounter:
 
 def authorize_and_reserve(
     db: Session, contract: DigitalContract, username: str, connector_id: str,
-    action: str, exec_env: str, app_image: str,
+    action: str, exec_env: str, application_code: str,
 ) -> UsageRecord:
     """决策并持久化预占；调用方必须随后 consume 或 release。"""
+    exec_env = _normalize_exec_env(exec_env)
     counter = _locked_counter(db, contract.contract_id, action)
     request_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     context = {
         "now": int(now.timestamp()),
         "used_count": counter.used_count + counter.reserved_count,
-        "exec_env": exec_env, "app_image": app_image,
+        "exec_env": exec_env, "application_code": application_code,
     }
     decision_input = {
         "contract_id": contract.contract_id,
         "subject": {"username": username, "connector_id": connector_id},
         "action": action,
-        "resource": {"product_id": contract.product_id, "app_image": app_image},
+        "resource": {"product_id": contract_subject(contract.document)["dataProductId"], "application_code": application_code},
         "context": context,
     }
     try:
@@ -149,7 +160,7 @@ def authorize_and_reserve(
         db.commit()
         raise UsageError(record.reason or "数字合约策略拒绝本次使用", 403)
     counter.reserved_count += 1
-    audit_append(db, event_type="usage.reserved", stream_id=contract_stream(contract.contract_id), resource_type="usage_record", resource_id=request_id, actor={"subject": username}, payload={"contract_id": contract.contract_id, "action": action, "usage_record_id": request_id, "app_image": app_image})
+    audit_append(db, event_type="usage.reserved", stream_id=contract_stream(contract.contract_id), resource_type="usage_record", resource_id=request_id, actor={"subject": username}, payload={"contract_id": contract.contract_id, "action": action, "usage_record_id": request_id, "application_code": application_code})
     db.commit()
     db.refresh(record)
     return record
@@ -161,7 +172,7 @@ def authorize_and_reserve_workflow(
 ) -> UsageRecord:
     """一次工作流运行的统一使用控制：逐 App 决策，任一被拒即整体拒绝。
 
-    apps: [{"exec_env": <capability>, "app_image": <name>}, ...]
+    apps: [{"exec_env": <capability>, "application_code": <code>}, ...]
     锁计数器一次、发布合约一次；全部允许才建**一条** reserved 记录并预占 1 次
     （保证“一次运行=消费 1 次”）。调用方随后须 consume 或 release。
     """
@@ -176,15 +187,16 @@ def authorize_and_reserve_workflow(
         client = get_opa_client()
         client.publish_contract(contract.contract_id, compile_contract(contract))
         for app in apps:
+            exec_env = _normalize_exec_env(app["exec_env"])
             context = {
                 "now": int(now.timestamp()), "used_count": used,
-                "exec_env": app["exec_env"], "app_image": app["app_image"],
+                "exec_env": exec_env, "application_code": app["application_code"],
             }
             decision_input = {
                 "contract_id": contract.contract_id,
                 "subject": {"username": username, "connector_id": connector_id},
                 "action": action,
-                "resource": {"product_id": contract.product_id, "app_image": app["app_image"]},
+                "resource": {"product_id": contract_subject(contract.document)["dataProductId"], "application_code": app["application_code"]},
                 "context": context,
             }
             last_decision = client.decide(decision_input)
@@ -201,7 +213,7 @@ def authorize_and_reserve_workflow(
                 audit_append(db, event_type="usage.decision.denied", stream_id=contract_stream(contract.contract_id), resource_type="usage_record", resource_id=request_id, actor={"subject": username}, payload={"contract_id": contract.contract_id, "action": action, "reason": record.reason, "decision": record.decision, "usage_record_id": request_id})
                 db.commit()
                 raise UsageError(
-                    record.reason or f"数字合约策略拒绝应用 {app['app_image']}", 403
+                    record.reason or f"数字合约策略拒绝应用 {app['application_code']}", 403
                 )
             matched_policy_ids.extend(last_decision.get("matched_policy_ids", []))
             obligations.extend(last_decision.get("obligations", []))
@@ -213,8 +225,8 @@ def authorize_and_reserve_workflow(
     obligation_status = _enforce_obligations(apps, obligations)
     context = {
         "now": int(now.timestamp()), "used_count": used,
-        "exec_env": ",".join(a["exec_env"] for a in apps),
-        "app_image": ",".join(a["app_image"] for a in apps),
+        "exec_env": ",".join(_normalize_exec_env(a["exec_env"]) for a in apps),
+        "application_code": ",".join(a["application_code"] for a in apps),
     }
     record = UsageRecord(
         request_id=request_id, contract_id=contract.contract_id,
@@ -226,7 +238,7 @@ def authorize_and_reserve_workflow(
     )
     db.add(record)
     counter.reserved_count += 1
-    audit_append(db, event_type="usage.reserved", stream_id=contract_stream(contract.contract_id), resource_type="usage_record", resource_id=request_id, actor={"subject": username}, payload={"contract_id": contract.contract_id, "action": action, "usage_record_id": request_id, "app_image": context["app_image"]})
+    audit_append(db, event_type="usage.reserved", stream_id=contract_stream(contract.contract_id), resource_type="usage_record", resource_id=request_id, actor={"subject": username}, payload={"contract_id": contract.contract_id, "action": action, "usage_record_id": request_id, "application_code": context["application_code"]})
     db.commit()
     db.refresh(record)
     return record
@@ -254,7 +266,7 @@ def authorize_and_reserve_actions(
         raise
 
 
-def consume(db: Session, record_id: str, job_id: str) -> None:
+def _consume_record(db: Session, record_id: str, job_id: str) -> None:
     record = db.get(UsageRecord, record_id)
     if not record or record.lifecycle != "reserved":
         raise UsageError("使用预占不存在或状态异常", 409)
@@ -264,12 +276,18 @@ def consume(db: Session, record_id: str, job_id: str) -> None:
     record.lifecycle = "consumed"
     record.job_id = job_id
     audit_append(db, event_type="usage.consumed", stream_id=contract_stream(record.contract_id), resource_type="usage_record", resource_id=record.request_id, actor={"subject": record.username}, payload={"contract_id": record.contract_id, "job_id": job_id, "usage_record_id": record.request_id})
+    return None
+
+
+def consume(db: Session, record_id: str, job_id: str) -> None:
+    _consume_record(db, record_id, job_id)
     db.commit()
 
 
 def consume_many(db: Session, records: list[UsageRecord], job_id: str) -> None:
     for record in records:
-        consume(db, record.id, job_id)
+        _consume_record(db, record.id, job_id)
+    db.commit()
 
 
 def release(db: Session, record_id: str, reason: str) -> None:
@@ -312,7 +330,7 @@ def compensate_many(db: Session, record_ids: list[str], reason: str) -> None:
 
 def check_operations(
     db: Session, contract: DigitalContract, username: str, connector_id: str,
-    operations: list[str], exec_env: str, app_image: str,
+    operations: list[str], exec_env: str, application_code: str,
 ) -> list[dict]:
     """只读符合性校验：逐个操作问 OPA 是否被合约允许，返回**被拒**的操作列表。
 
@@ -320,6 +338,7 @@ def check_operations(
     ``used_count + reserved_count``；真正的逐操作计数由
     :func:`authorize_and_reserve_actions` 完成。
     """
+    exec_env = _normalize_exec_env(exec_env)
     try:
         client = get_opa_client()
         client.publish_contract(contract.contract_id, compile_contract(contract))
@@ -335,8 +354,8 @@ def check_operations(
                 "contract_id": contract.contract_id,
                 "subject": {"username": username, "connector_id": connector_id},
                 "action": action,
-                "resource": {"product_id": contract.product_id, "app_image": app_image},
-                "context": {"now": now, "used_count": used_count, "exec_env": exec_env, "app_image": app_image},
+                "resource": {"product_id": contract_subject(contract.document)["dataProductId"], "application_code": application_code},
+                "context": {"now": now, "used_count": used_count, "exec_env": exec_env, "application_code": application_code},
             })
             if not decision.get("allowed", False):
                 denied.append({
@@ -353,12 +372,14 @@ def check_operations(
 def explain_denial(contract: DigitalContract, connector_id: str, action: str,
                    exec_env: str, now: int, used_count: int) -> str:
     """在不暴露策略正文的前提下，将 OPA default-deny 解释为可操作原因。"""
-    if contract.status != "filed":
+    exec_env = _normalize_exec_env(exec_env)
+    if contract_info(contract.document)["contractStatus"] != "filed":
         return "合约尚未备案或已失效"
-    if connector_id != contract.consumer_connector_id:
+    node_id = execution_nodes(contract.document)["consumerNodeId"]
+    if connector_id != node_id:
         return "当前连接器不是该合约约定的用数方"
-    candidates = [p for p in (contract.policies or [])
-                  if p.get("type") == "allow" and action in (p.get("actions") or [])]
+    candidates = [p for p in legacy_policy_input(contract.document)
+                  if p.get("effect") == "allow" and action in (p.get("actions") or [])]
     if not candidates:
         return f"合约未授权操作 {action}"
     all_failures: list[str] = []
@@ -371,7 +392,7 @@ def explain_denial(contract: DigitalContract, connector_id: str, action: str,
             failures.append("授权时间尚未开始")
         elif end is not None and now > end:
             failures.append("授权时间窗口已结束")
-        required_env = constraints.get("exec_env")
+        required_env = _normalize_exec_env(constraints.get("exec_env"))
         if required_env and required_env != exec_env:
             failures.append(f"执行环境不匹配（要求 {required_env}）")
         limit = constraints.get("count")
@@ -385,9 +406,10 @@ def explain_denial(contract: DigitalContract, connector_id: str, action: str,
 
 def preflight(
     db: Session, contract: DigitalContract, username: str, connector_id: str,
-    action: str, exec_env: str, app_image: str,
+    action: str, exec_env: str, application_code: str,
 ) -> dict:
     """无副作用预检；结果仅用于展示，真正提交时仍须重新决策和预占。"""
+    exec_env = _normalize_exec_env(exec_env)
     counter = db.execute(select(UsageCounter).where(
         UsageCounter.contract_id == contract.contract_id,
         UsageCounter.action == action,
@@ -399,10 +421,10 @@ def preflight(
         "contract_id": contract.contract_id,
         "subject": {"username": username, "connector_id": connector_id},
         "action": action,
-        "resource": {"product_id": contract.product_id, "app_image": app_image},
+        "resource": {"product_id": contract_subject(contract.document)["dataProductId"], "application_code": application_code},
         "context": {
             "now": int(datetime.now(timezone.utc).timestamp()),
-            "used_count": used + reserved, "exec_env": exec_env, "app_image": app_image,
+            "used_count": used + reserved, "exec_env": exec_env, "application_code": application_code,
         },
     }
     try:
